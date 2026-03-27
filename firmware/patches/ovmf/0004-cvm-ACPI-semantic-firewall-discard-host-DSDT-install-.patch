@@ -1,0 +1,1486 @@
+From d6eb0976e85dfb652988e36e9f8cf4477e77cd11 Mon Sep 17 00:00:00 2001
+From: Kawiri <patches@kawiri.ai>
+Date: Fri, 27 Feb 2026 17:37:33 +0100
+Subject: [PATCH] =?UTF-8?q?cvm:=20ACPI=20semantic=20firewall=20=E2=80=94?=
+ =?UTF-8?q?=20discard=20host=20DSDT,=20install=20hardcoded=20measured=20DS?=
+ =?UTF-8?q?DT?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the previous approach of skipping ACPI measurement (old patch 0004)
+with a complete ACPI semantic firewall that:
+
+1. Discards ALL host-provided AML tables (DSDT/SSDT/PSDT/OSDT) — prevents
+   BadAML attacks and eliminates host-dependent RTMR values
+2. Skips measurement of ALL QEMU fw_cfg ACPI blobs — non-AML tables
+   (FADT, MADT, MCFG, etc.) are host-generated and vary with hardware
+   config (MADT changes with -smp count, DMAR with vIOMMU). Measuring
+   them creates host-dependent RTMRs with no security benefit.
+2. Installs a hardcoded, build-time-compiled DSDT (CvmDsdt.asl) with:
+   - Static q35 topology: PCI0, ISA bridge, COM1, HPET, GPE0
+   - Full 128-entry _PRT routing tables (PIC + APIC mode)
+   - _OSC that grants PME/AER/PCIeCapability, denies hotplug
+   - Sentinel values for PCI MMIO windows (patched at runtime)
+3. Validates MMIO isolation invariants before patching:
+   - 32-bit window must exist and fit in UINT32 range
+   - 64-bit window (optional) must be above 4GiB
+   - Per-HOB interval overlap check proves MMIO ∩ RAM = ∅
+5. Measures the hardcoded DSDT (before sentinel patching) for deterministic
+   RTMR attestation — the only ACPI measurement in the entire fw_cfg path
+
+New files:
+  CvmDsdt.asl      — Static q35 DSDT template (compiled by iasl at build time)
+  CvmDsdtRecon.c/h  — Reconstructor: patch, validate, measure, install
+
+Modified files:
+  QemuFwCfgAcpi.c       — Hook points to skip/discard host AML, call reconstructor
+  DxeAcpiPlatformLib.inf — Add sources, HobLib, PCI MMIO PCDs
+
+Signed-off-by: Kawiri <patches@kawiri.ai>
+---
+ OvmfPkg/Library/AcpiPlatformLib/CvmDsdt.asl   | 745 ++++++++++++++++++
+ .../Library/AcpiPlatformLib/CvmDsdtRecon.c    | 443 +++++++++++
+ .../Library/AcpiPlatformLib/CvmDsdtRecon.h    |  57 ++
+ .../AcpiPlatformLib/DxeAcpiPlatformLib.inf    |   7 +
+ .../Library/AcpiPlatformLib/QemuFwCfgAcpi.c   |  90 +-
+ 5 files changed, 1330 insertions(+), 22 deletions(-)
+ create mode 100644 OvmfPkg/Library/AcpiPlatformLib/CvmDsdt.asl
+ create mode 100644 OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.c
+ create mode 100644 OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.h
+
+diff --git a/OvmfPkg/Library/AcpiPlatformLib/CvmDsdt.asl b/OvmfPkg/Library/AcpiPlatformLib/CvmDsdt.asl
+new file mode 100644
+index 0000000..1c6a420
+--- /dev/null
++++ b/OvmfPkg/Library/AcpiPlatformLib/CvmDsdt.asl
+@@ -0,0 +1,745 @@
++/** @file
++  CVM Static DSDT for QEMU q35 machine type.
++
++  This DSDT is compiled at OVMF build time and installed by the
++  ACPI Semantic Firewall (CvmDsdtRecon.c). The host-provided DSDT
++  is discarded entirely — no host-generated AML is ever executed.
++
++  Runtime patching: magic sentinel values in _CRS are replaced with
++  actual PCI MMIO window addresses read from OVMF PCDs at DXE time.
++
++  The interrupt routing tables (PRTP/PRTA) replicate QEMU's
++  build_q35_routing_table() output exactly: 128 entries covering
++  slots 0x00-0x1F with 4 interrupt pins each.
++
++  Copyright (c) 2025, Kawiri. All rights reserved.
++  SPDX-License-Identifier: BSD-2-Clause-Patent
++**/
++
++DefinitionBlock ("CvmDsdt.aml", "DSDT", 2, "KAWIRI", "CVMDSDT", 0x00000001)
++{
++    //
++    // Interrupt model switch: PIC (0) / APIC (1)
++    //
++    Name (PICF, Zero)
++    Method (_PIC, 1, NotSerialized)
++    {
++        Store (Arg0, PICF)
++    }
++
++    //
++    // Sleep states — S5 only (no S3/S4 in CVM)
++    //
++    Name (\_S5, Package (0x04) { 0x00, 0x00, 0x00, 0x00 })
++
++    //
++    // Debug output to QEMU I/O port 0x0402
++    //
++    Method (DBUG, 1, NotSerialized)
++    {
++        OperationRegion (DBG0, SystemIO, 0x0402, One)
++        Field (DBG0, ByteAcc, NoLock, Preserve) { DBGB, 8 }
++        Store (Arg0, DBGB)
++    }
++
++    Scope (\_SB)
++    {
++        //
++        // ============================================================
++        // PCI Root Bridge (q35 / ICH9)
++        // ============================================================
++        //
++        Device (PCI0)
++        {
++            Name (_HID, EisaId ("PNP0A08"))  // PCIe root bridge
++            Name (_CID, EisaId ("PNP0A03"))  // PCI-compatible
++            Name (_ADR, Zero)
++            Name (_UID, Zero)
++
++            //
++            // _OSC: PCIe capability negotiation (trusted, minimal)
++            //
++            // Grants PME and AER (bits 2-4), denies hotplug (bits 0-1).
++            // Linux needs this to enable native PCIe error reporting.
++            //
++            // UUID: 33DB4D5B-1FF7-401C-9657-7441C03DD766 (PCIe Host Bridge)
++            //
++            Method (_OSC, 4, Serialized)
++            {
++                CreateDWordField (Arg3, 0x00, CDW1)
++                CreateDWordField (Arg3, 0x04, CDW2)
++                CreateDWordField (Arg3, 0x08, CDW3)
++
++                If (LEqual (Arg0, ToUUID ("33DB4D5B-1FF7-401C-9657-7441C03DD766")))
++                {
++                    // Mask off hotplug capabilities (bits 0-1), keep PME/AER/Cap (bits 2-4)
++                    And (CDW3, 0x1C, CDW3)
++
++                    If (LNotEqual (Arg1, One))
++                    {
++                        Or (CDW1, 0x08, CDW1)  // Unrecognized revision
++                    }
++                }
++                Else
++                {
++                    Or (CDW1, 0x04, CDW1)  // Unrecognized UUID
++                }
++
++                Return (Arg3)
++            }
++
++            //
++            // _CRS: PCI resource windows with sentinel patching
++            //
++            // Magic sentinels are replaced at runtime by CvmDsdtRecon.c:
++            //
++            //   DWord sentinels (32-bit MMIO):
++            //     0xCAFE0001 -> PcdPciMmio32Base
++            //     0xCAFE0002 -> PcdPciMmio32Base + PcdPciMmio32Size - 1
++            //     0xCAFE0003 -> PcdPciMmio32Size
++            //
++            //   QWord sentinels (64-bit MMIO):
++            //     0xCAFE000400000000 -> PcdPciMmio64Base
++            //     0xCAFE000500000000 -> PcdPciMmio64Base + PcdPciMmio64Size - 1
++            //     0xCAFE000600000000 -> PcdPciMmio64Size
++            //
++            Name (_CRS, ResourceTemplate ()
++            {
++                // Bus numbers: 0x00 - 0xFF
++                WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode,
++                    0x0000, 0x0000, 0x00FF, 0x0000, 0x0100)
++
++                // I/O: PCI config mechanism
++                IO (Decode16, 0x0CF8, 0x0CF8, 0x01, 0x08)
++
++                // I/O: 0x0000 - 0x0CF7
++                WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
++                    0x0000, 0x0000, 0x0CF7, 0x0000, 0x0CF8)
++
++                // I/O: 0x0D00 - 0xFFFF
++                WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
++                    0x0000, 0x0D00, 0xFFFF, 0x0000, 0xF300)
++
++                // VGA memory: 0xA0000 - 0xBFFFF
++                DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
++                    Cacheable, ReadWrite,
++                    0x00000000, 0x000A0000, 0x000BFFFF, 0x00000000, 0x00020000)
++
++                // 32-bit PCI MMIO window — sentinels patched at runtime
++                DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
++                    NonCacheable, ReadWrite,
++                    0x00000000,
++                    0xCAFE0001,         // _MIN: sentinel -> PcdPciMmio32Base
++                    0xCAFE0002,         // _MAX: sentinel -> Mmio32Limit
++                    0x00000000,
++                    0xCAFE0003)         // _LEN: sentinel -> PcdPciMmio32Size
++
++                // 64-bit PCI MMIO window — sentinels patched at runtime
++                QWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
++                    NonCacheable, ReadWrite,
++                    0x0000000000000000,
++                    0xCAFE000400000000, // _MIN: sentinel -> PcdPciMmio64Base
++                    0xCAFE000500000000, // _MAX: sentinel -> Mmio64Limit
++                    0x0000000000000000,
++                    0xCAFE000600000000) // _LEN: sentinel -> PcdPciMmio64Size
++            })
++
++            //
++            // _PRT: PCI interrupt routing tables (q35 layout)
++            //
++            // 128 entries: 32 slots x 4 interrupt pins.
++            // Generated from QEMU build_q35_routing_table() / append_q35_prt_entry().
++            //
++            // Slots 0x00-0x17: E + (slot & 3) rotation in EFGH group
++            // Slot 0x18: starts at E
++            // Slots 0x19-0x1D: starts at A (ICH9 internal devices)
++            // Slot 0x1E: starts at E (PCIe-to-PCI bridge)
++            // Slot 0x1F: starts at A (LPC/ISA bridge)
++            //
++
++            // PIC-mode routing: references \_SB.LNK{A-H} link devices
++            Name (PRTP, Package (128)
++            {
++                Package (0x04) { 0x0000FFFF, 0x00, LNKE, 0x00 },
++                Package (0x04) { 0x0000FFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x0000FFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x0000FFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x00, LNKF, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x01, LNKG, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x02, LNKH, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x03, LNKE, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x00, LNKG, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x01, LNKH, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x02, LNKE, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x03, LNKF, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x00, LNKH, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x01, LNKE, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x02, LNKF, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x03, LNKG, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x00, LNKE, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x00, LNKF, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x01, LNKG, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x02, LNKH, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x03, LNKE, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x00, LNKG, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x01, LNKH, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x02, LNKE, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x03, LNKF, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x00, LNKH, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x01, LNKE, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x02, LNKF, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x03, LNKG, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x00, LNKE, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x00, LNKF, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x01, LNKG, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x02, LNKH, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x03, LNKE, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x00, LNKG, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x01, LNKH, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x02, LNKE, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x03, LNKF, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x00, LNKH, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x01, LNKE, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x02, LNKF, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x03, LNKG, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x00, LNKE, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x00, LNKF, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x01, LNKG, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x02, LNKH, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x03, LNKE, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x00, LNKG, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x01, LNKH, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x02, LNKE, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x03, LNKF, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x00, LNKH, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x01, LNKE, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x02, LNKF, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x03, LNKG, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x00, LNKE, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x00, LNKF, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x01, LNKG, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x02, LNKH, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x03, LNKE, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x00, LNKG, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x01, LNKH, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x02, LNKE, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x03, LNKF, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x00, LNKH, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x01, LNKE, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x02, LNKF, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x03, LNKG, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x00, LNKE, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x00, LNKF, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x01, LNKG, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x02, LNKH, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x03, LNKE, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x00, LNKG, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x01, LNKH, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x02, LNKE, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x03, LNKF, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x00, LNKH, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x01, LNKE, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x02, LNKF, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x03, LNKG, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x00, LNKE, 0x00 },  // Slot 0x18: E
++                Package (0x04) { 0x0018FFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x00, LNKA, 0x00 },  // Slots 0x19-0x1D: A (ICH9)
++                Package (0x04) { 0x0019FFFF, 0x01, LNKB, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x02, LNKC, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x03, LNKD, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x00, LNKA, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x01, LNKB, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x02, LNKC, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x03, LNKD, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x00, LNKA, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x01, LNKB, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x02, LNKC, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x03, LNKD, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x00, LNKA, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x01, LNKB, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x02, LNKC, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x03, LNKD, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x00, LNKA, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x01, LNKB, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x02, LNKC, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x03, LNKD, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x00, LNKE, 0x00 },  // Slot 0x1E: E (PCIe-PCI bridge)
++                Package (0x04) { 0x001EFFFF, 0x01, LNKF, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x02, LNKG, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x03, LNKH, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x00, LNKA, 0x00 },  // Slot 0x1F: A (LPC)
++                Package (0x04) { 0x001FFFFF, 0x01, LNKB, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x02, LNKC, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x03, LNKD, 0x00 }
++            })
++
++            // APIC-mode routing: references \_SB.GSI{A-H} link devices
++            Name (PRTA, Package (128)
++            {
++                Package (0x04) { 0x0000FFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x0000FFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x0000FFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x0000FFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x00, GSIF, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x01, GSIG, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x02, GSIH, 0x00 },
++                Package (0x04) { 0x0001FFFF, 0x03, GSIE, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x00, GSIG, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x01, GSIH, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x02, GSIE, 0x00 },
++                Package (0x04) { 0x0002FFFF, 0x03, GSIF, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x00, GSIH, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x01, GSIE, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x02, GSIF, 0x00 },
++                Package (0x04) { 0x0003FFFF, 0x03, GSIG, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x0004FFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x00, GSIF, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x01, GSIG, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x02, GSIH, 0x00 },
++                Package (0x04) { 0x0005FFFF, 0x03, GSIE, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x00, GSIG, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x01, GSIH, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x02, GSIE, 0x00 },
++                Package (0x04) { 0x0006FFFF, 0x03, GSIF, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x00, GSIH, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x01, GSIE, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x02, GSIF, 0x00 },
++                Package (0x04) { 0x0007FFFF, 0x03, GSIG, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x0008FFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x00, GSIF, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x01, GSIG, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x02, GSIH, 0x00 },
++                Package (0x04) { 0x0009FFFF, 0x03, GSIE, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x00, GSIG, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x01, GSIH, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x02, GSIE, 0x00 },
++                Package (0x04) { 0x000AFFFF, 0x03, GSIF, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x00, GSIH, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x01, GSIE, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x02, GSIF, 0x00 },
++                Package (0x04) { 0x000BFFFF, 0x03, GSIG, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x000CFFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x00, GSIF, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x01, GSIG, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x02, GSIH, 0x00 },
++                Package (0x04) { 0x000DFFFF, 0x03, GSIE, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x00, GSIG, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x01, GSIH, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x02, GSIE, 0x00 },
++                Package (0x04) { 0x000EFFFF, 0x03, GSIF, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x00, GSIH, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x01, GSIE, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x02, GSIF, 0x00 },
++                Package (0x04) { 0x000FFFFF, 0x03, GSIG, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x0010FFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x00, GSIF, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x01, GSIG, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x02, GSIH, 0x00 },
++                Package (0x04) { 0x0011FFFF, 0x03, GSIE, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x00, GSIG, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x01, GSIH, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x02, GSIE, 0x00 },
++                Package (0x04) { 0x0012FFFF, 0x03, GSIF, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x00, GSIH, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x01, GSIE, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x02, GSIF, 0x00 },
++                Package (0x04) { 0x0013FFFF, 0x03, GSIG, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x0014FFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x00, GSIF, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x01, GSIG, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x02, GSIH, 0x00 },
++                Package (0x04) { 0x0015FFFF, 0x03, GSIE, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x00, GSIG, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x01, GSIH, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x02, GSIE, 0x00 },
++                Package (0x04) { 0x0016FFFF, 0x03, GSIF, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x00, GSIH, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x01, GSIE, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x02, GSIF, 0x00 },
++                Package (0x04) { 0x0017FFFF, 0x03, GSIG, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x0018FFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x00, GSIA, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x01, GSIB, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x02, GSIC, 0x00 },
++                Package (0x04) { 0x0019FFFF, 0x03, GSID, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x00, GSIA, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x01, GSIB, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x02, GSIC, 0x00 },
++                Package (0x04) { 0x001AFFFF, 0x03, GSID, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x00, GSIA, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x01, GSIB, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x02, GSIC, 0x00 },
++                Package (0x04) { 0x001BFFFF, 0x03, GSID, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x00, GSIA, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x01, GSIB, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x02, GSIC, 0x00 },
++                Package (0x04) { 0x001CFFFF, 0x03, GSID, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x00, GSIA, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x01, GSIB, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x02, GSIC, 0x00 },
++                Package (0x04) { 0x001DFFFF, 0x03, GSID, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x00, GSIE, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x01, GSIF, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x02, GSIG, 0x00 },
++                Package (0x04) { 0x001EFFFF, 0x03, GSIH, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x00, GSIA, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x01, GSIB, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x02, GSIC, 0x00 },
++                Package (0x04) { 0x001FFFFF, 0x03, GSID, 0x00 }
++            })
++
++            Method (_PRT, 0, NotSerialized)
++            {
++                If (PICF) { Return (PRTA) }
++                Else      { Return (PRTP) }
++            }
++
++            //
++            // ISA bridge at device 1F.0 (ICH9 LPC)
++            //
++            Device (ISA)
++            {
++                Name (_ADR, 0x001F0000)
++
++                Device (COM1)
++                {
++                    Name (_HID, EisaId ("PNP0501"))
++                    Name (_UID, One)
++                    Name (_CRS, ResourceTemplate ()
++                    {
++                        IO (Decode16, 0x03F8, 0x03F8, 0x01, 0x08)
++                        IRQNoFlags () { 4 }
++                    })
++                }
++            }
++
++            //
++            // GPE0 block (no executable handlers — no hotplug)
++            //
++            Device (GPE0)
++            {
++                Name (_HID, "PNP0A06")
++                Name (_UID, "GPE0")
++            }
++
++        }  // End PCI0
++
++        //
++        // ============================================================
++        // PIRQ routing registers (ICH9 LPC PCI config 0x60-0x6B)
++        // ============================================================
++        //
++        // This OperationRegion is placed under \_SB to match QEMU's
++        // generated DSDT structure. In APIC mode (which CVMs always use),
++        // the PIRQ link devices are not exercised.
++        //
++        OperationRegion (PIRQ, PCI_Config, 0x60, 0x0C)
++        Field (PIRQ, ByteAcc, NoLock, Preserve)
++        {
++            PRQA, 8,
++            PRQB, 8,
++            PRQC, 8,
++            PRQD, 8,
++            Offset (0x08),
++            PRQE, 8,
++            PRQF, 8,
++            PRQG, 8,
++            PRQH, 8
++        }
++
++        //
++        // ============================================================
++        // PIRQ link devices LNKA-LNKH (PIC mode)
++        // ============================================================
++        //
++        Device (LNKA)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, One)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQA & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQA |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQA & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQA = Local0
++            }
++        }
++
++        Device (LNKB)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x02)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQB & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQB |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQB & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQB = Local0
++            }
++        }
++
++        Device (LNKC)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x03)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQC & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQC |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQC & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQC = Local0
++            }
++        }
++
++        Device (LNKD)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x04)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQD & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQD |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQD & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQD = Local0
++            }
++        }
++
++        Device (LNKE)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x05)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQE & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQE |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQE & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQE = Local0
++            }
++        }
++
++        Device (LNKF)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x06)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQF & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQF |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQF & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQF = Local0
++            }
++        }
++
++        Device (LNKG)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x07)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQG & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQG |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQG & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQG = Local0
++            }
++        }
++
++        Device (LNKH)
++        {
++            Name (_HID, EisaId ("PNP0C0F"))
++            Name (_UID, 0x08)
++            Name (_PRS, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) { 5, 10, 11 } })
++            Method (_STA, 0, NotSerialized)
++            {
++                If (PRQH & 0x80) { Return (0x09) }
++                Return (0x0B)
++            }
++            Method (_DIS, 0, NotSerialized) { PRQH |= 0x80 }
++            Method (_CRS, 0, Serialized)
++            {
++                Name (PRR0, ResourceTemplate () { IRQ (Level, ActiveLow, Shared,) {} })
++                CreateWordField (PRR0, One, TMP)
++                Local0 = PRQH & 0x0F
++                TMP = (One << Local0)
++                Return (PRR0)
++            }
++            Method (_SRS, 1, NotSerialized)
++            {
++                CreateWordField (Arg0, One, TMP)
++                Local0 = FindSetRightBit (TMP)
++                Local0--
++                PRQH = Local0
++            }
++        }
++
++        //
++        // ============================================================
++        // GSI link devices (APIC mode — fixed interrupt routing)
++        // ============================================================
++        //
++        Device (GSIA) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x10) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x10 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSIB) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x11) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x11 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSIC) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x12) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x12 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSID) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x13) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x13 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSIE) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x14) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x14 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSIF) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x15) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x15 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSIG) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x16) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x16 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++        Device (GSIH) { Name (_HID, EisaId ("PNP0C0F")) Name (_UID, 0x17) Name (_PRS, ResourceTemplate () { Interrupt (ResourceConsumer, Level, ActiveHigh, Shared) { 0x17 } }) Method (_STA, 0) { Return (0x0B) } Method (_CRS, 0) { Return (_PRS) } Method (_SRS, 1) {} }
++
++        //
++        // ============================================================
++        // HPET (High Precision Event Timer)
++        // ============================================================
++        //
++        Device (HPET)
++        {
++            Name (_HID, EisaId ("PNP0103"))
++            Name (_UID, Zero)
++            Method (_STA, 0, NotSerialized) { Return (0x0F) }
++            Name (_CRS, ResourceTemplate ()
++            {
++                Memory32Fixed (ReadWrite, 0xFED00000, 0x00000400)
++            })
++        }
++
++    }  // End \_SB
++}
+diff --git a/OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.c b/OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.c
+new file mode 100644
+index 0000000..ba3761a
+--- /dev/null
++++ b/OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.c
+@@ -0,0 +1,452 @@
++/** @file
++  CVM DSDT Reconstructor implementation.
++
++  Discards the host-provided DSDT/SSDT entirely and installs a
++  hardcoded, build-time-compiled DSDT from firmware. PCI MMIO
++  window values are patched in via magic sentinels at DXE time.
++
++  Copyright (c) 2025, Kawiri. All rights reserved.
++  SPDX-License-Identifier: BSD-2-Clause-Patent
++**/
++
++#include "CvmDsdtRecon.h"
++
++#include <IndustryStandard/Acpi.h>
++#include <IndustryStandard/UefiTcgPlatform.h>
++#include <Library/BaseLib.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/DebugLib.h>
++#include <Library/HobLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Library/PcdLib.h>
++#include <Library/TpmMeasurementLib.h>
++#include <Pi/PiHob.h>
++
++//
++// The compiled DSDT AML blob, generated from CvmDsdt.asl at build time.
++//
++// Build pipeline (ovmf.nix postPatch):
++//   iasl -vw 6049 CvmDsdt.asl  ->  CvmDsdt.aml
++//   xxd -i CvmDsdt.aml         ->  CvmDsdtTemplate.h
++//
++// This produces: unsigned char CvmDsdt_aml[] and unsigned int CvmDsdt_aml_len
++//
++#include "CvmDsdtTemplate.h"
++
++//
++// Sentinel values -- must match CvmDsdt.asl
++//
++#define CVM_SENTINEL_MMIO32_BASE   0xCAFE0001UL
++#define CVM_SENTINEL_MMIO32_LIMIT  0xCAFE0002UL
++#define CVM_SENTINEL_MMIO32_SIZE   0xCAFE0003UL
++#define CVM_SENTINEL_MMIO64_BASE   0xCAFE000400000000ULL
++#define CVM_SENTINEL_MMIO64_LIMIT  0xCAFE000500000000ULL
++#define CVM_SENTINEL_MMIO64_SIZE   0xCAFE000600000000ULL
++
++//
++// MMIO isolation bounds
++//
++#define CVM_MAX_MMIO32_SIZE  SIZE_2GB
++#define CVM_MIN_MMIO64_BASE  0x100000000ULL
++
++/**
++  Search for a 4-byte sentinel in the AML blob and replace it.
++
++  Scans the entire AML blob for the first occurrence of the
++  little-endian sentinel value and replaces it with the given value.
++
++  @param[in,out] Aml       Pointer to mutable AML blob.
++  @param[in]     AmlSize   Size of AML blob in bytes.
++  @param[in]     Sentinel  The 4-byte sentinel (native endian).
++  @param[in]     Value     The replacement value (native endian).
++
++  @retval EFI_SUCCESS    Sentinel found and replaced.
++  @retval EFI_NOT_FOUND  Sentinel not found in AML.
++**/
++STATIC
++EFI_STATUS
++PatchDword (
++  IN OUT UINT8   *Aml,
++  IN     UINTN   AmlSize,
++  IN     UINT32  Sentinel,
++  IN     UINT32  Value
++  )
++{
++  UINTN  Offset;
++
++  for (Offset = 0; Offset + sizeof (UINT32) <= AmlSize; Offset++) {
++    if (CompareMem (&Aml[Offset], &Sentinel, sizeof (UINT32)) == 0) {
++      CopyMem (&Aml[Offset], &Value, sizeof (UINT32));
++      DEBUG ((
++        DEBUG_VERBOSE,
++        "CvmDsdt: patched DWord at 0x%x: 0x%08x -> 0x%08x\n",
++        Offset,
++        Sentinel,
++        Value
++        ));
++      return EFI_SUCCESS;
++    }
++  }
++
++  DEBUG ((DEBUG_ERROR, "CvmDsdt: DWord sentinel 0x%08x not found!\n", Sentinel));
++  return EFI_NOT_FOUND;
++}
++
++/**
++  Search for an 8-byte sentinel in the AML blob and replace it.
++
++  @param[in,out] Aml       Pointer to mutable AML blob.
++  @param[in]     AmlSize   Size of AML blob in bytes.
++  @param[in]     Sentinel  The 8-byte sentinel (native endian).
++  @param[in]     Value     The replacement value (native endian).
++
++  @retval EFI_SUCCESS    Sentinel found and replaced.
++  @retval EFI_NOT_FOUND  Sentinel not found in AML.
++**/
++STATIC
++EFI_STATUS
++PatchQword (
++  IN OUT UINT8   *Aml,
++  IN     UINTN   AmlSize,
++  IN     UINT64  Sentinel,
++  IN     UINT64  Value
++  )
++{
++  UINTN  Offset;
++
++  for (Offset = 0; Offset + sizeof (UINT64) <= AmlSize; Offset++) {
++    if (CompareMem (&Aml[Offset], &Sentinel, sizeof (UINT64)) == 0) {
++      CopyMem (&Aml[Offset], &Value, sizeof (UINT64));
++      DEBUG ((
++        DEBUG_VERBOSE,
++        "CvmDsdt: patched QWord at 0x%x: 0x%016Lx -> 0x%016Lx\n",
++        Offset,
++        Sentinel,
++        Value
++        ));
++      return EFI_SUCCESS;
++    }
++  }
++
++  DEBUG ((DEBUG_ERROR, "CvmDsdt: QWord sentinel 0x%016Lx not found!\n", Sentinel));
++  return EFI_NOT_FOUND;
++}
++
++//
++// OSDT ("Override System Description Table") is not defined in edk2 headers
++// but Linux/ACPICA loads AML from it (see acpi_tb_load_namespace in tbxfload.c).
++//
++#define CVM_ACPI_OSDT_SIGNATURE  SIGNATURE_32('O', 'S', 'D', 'T')
++
++BOOLEAN
++CvmIsAmlTable (
++  IN UINT32  Signature
++  )
++{
++  return (Signature == EFI_ACPI_1_0_DIFFERENTIATED_SYSTEM_DESCRIPTION_TABLE_SIGNATURE) ||
++         (Signature == EFI_ACPI_1_0_SECONDARY_SYSTEM_DESCRIPTION_TABLE_SIGNATURE) ||
++         (Signature == EFI_ACPI_1_0_PERSISTENT_SYSTEM_DESCRIPTION_TABLE_SIGNATURE) ||
++         (Signature == CVM_ACPI_OSDT_SIGNATURE);
++}
++
++EFI_STATUS
++EFIAPI
++CvmInstallReconstructedDsdt (
++  IN  EFI_ACPI_TABLE_PROTOCOL  *AcpiProtocol,
++  OUT UINTN                    *InstalledKey
++  )
++{
++  EFI_STATUS                  Status;
++  UINT8                       *DsdtCopy;
++  UINTN                       DsdtSize;
++  UINT64                      Mmio32Base;
++  UINT64                      Mmio32Size;
++  UINT64                      Mmio64Base;
++  UINT64                      Mmio64Size;
++  EFI_ACPI_DESCRIPTION_HEADER *Header;
++
++  DsdtSize = CvmDsdt_aml_len;
++  ASSERT (DsdtSize >= sizeof (EFI_ACPI_DESCRIPTION_HEADER));
++
++  //
++  // Step 1: Read PCI MMIO PCDs
++  //
++  Mmio32Base = PcdGet64 (PcdPciMmio32Base);
++  Mmio32Size = PcdGet64 (PcdPciMmio32Size);
++  Mmio64Base = PcdGet64 (PcdPciMmio64Base);
++  Mmio64Size = PcdGet64 (PcdPciMmio64Size);
++
++  DEBUG ((
++    DEBUG_INFO,
++    "CvmDsdt: MMIO32 base=0x%Lx size=0x%Lx\n",
++    Mmio32Base,
++    Mmio32Size
++    ));
++  DEBUG ((
++    DEBUG_INFO,
++    "CvmDsdt: MMIO64 base=0x%Lx size=0x%Lx\n",
++    Mmio64Base,
++    Mmio64Size
++    ));
++
++  //
++  // Step 2: Validate MMIO isolation invariants
++  //
++
++  // 32-bit window must exist
++  if ((Mmio32Base == 0) || (Mmio32Size == 0)) {
++    DEBUG ((DEBUG_ERROR, "CvmDsdt: FATAL - no 32-bit MMIO window\n"));
++    return EFI_SECURITY_VIOLATION;
++  }
++
++  // Check overflow
++  if (Mmio32Base + Mmio32Size < Mmio32Base) {
++    DEBUG ((DEBUG_ERROR, "CvmDsdt: FATAL - 32-bit MMIO overflow\n"));
++    return EFI_SECURITY_VIOLATION;
++  }
++
++  // Sanity bound
++  if (Mmio32Size > CVM_MAX_MMIO32_SIZE) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "CvmDsdt: FATAL - 32-bit MMIO too large: 0x%Lx\n",
++      Mmio32Size
++      ));
++    return EFI_SECURITY_VIOLATION;
++  }
++
++  // Must fit in 32-bit DWordMemory descriptor — reject values above 4GiB
++  // to prevent silent truncation when patching AML sentinels.
++  if (Mmio32Base + Mmio32Size - 1 > MAX_UINT32) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "CvmDsdt: FATAL - 32-bit MMIO exceeds 4GiB: base=0x%Lx size=0x%Lx\n",
++      Mmio32Base,
++      Mmio32Size
++      ));
++    return EFI_SECURITY_VIOLATION;
++  }
++
++  // 64-bit window: optional (no GPU = no 64-bit MMIO)
++  if (Mmio64Size > 0) {
++    if (Mmio64Base < CVM_MIN_MMIO64_BASE) {
++      DEBUG ((
++        DEBUG_ERROR,
++        "CvmDsdt: FATAL - 64-bit MMIO base below 4GiB: 0x%Lx\n",
++        Mmio64Base
++        ));
++      return EFI_SECURITY_VIOLATION;
++    }
++
++    if (Mmio64Base + Mmio64Size < Mmio64Base) {
++      DEBUG ((DEBUG_ERROR, "CvmDsdt: FATAL - 64-bit MMIO overflow\n"));
++      return EFI_SECURITY_VIOLATION;
++    }
++  }
++
++  //
++  // CRITICAL: Prove MMIO ∩ RAM = ∅ by checking resource HOBs.
++  //
++  // The MMIO PCDs are populated from QEMU's fw_cfg (etc/reserved-memory-end).
++  // A malicious host could set MMIO64 to overlap encrypted guest RAM.
++  // Resource HOBs are securely populated by the CPU TEE (TDX/SEV firmware),
++  // so they represent the ground truth for physical memory layout.
++  //
++  {
++    EFI_PEI_HOB_POINTERS  Hob;
++    UINT64                Mmio32End;
++    UINT64                Mmio64End;
++
++    Mmio32End = Mmio32Base + Mmio32Size;
++    Mmio64End = (Mmio64Size > 0) ? (Mmio64Base + Mmio64Size) : 0;
++
++    //
++    // Per-HOB interval overlap check for both MMIO windows.
++    // Each RAM region [RamStart, RamEnd) is tested against both
++    // MMIO32 and MMIO64 windows using standard interval overlap:
++    //   overlap iff (A.start < B.end) && (B.start < A.end)
++    //
++    Hob.Raw = GetFirstHob (EFI_HOB_TYPE_RESOURCE_DESCRIPTOR);
++    while (Hob.Raw != NULL) {
++      if (Hob.ResourceDescriptor->ResourceType == EFI_RESOURCE_SYSTEM_MEMORY) {
++        UINT64 RamStart = Hob.ResourceDescriptor->PhysicalStart;
++        UINT64 RamEnd   = RamStart + Hob.ResourceDescriptor->ResourceLength;
++
++        if ((Mmio32Size > 0) && (Mmio32Base < RamEnd) && (RamStart < Mmio32End)) {
++          DEBUG ((
++            DEBUG_ERROR,
++            "CvmDsdt: FATAL - MMIO32 [0x%Lx, 0x%Lx) overlaps RAM [0x%Lx, 0x%Lx)\n",
++            Mmio32Base,
++            Mmio32End,
++            RamStart,
++            RamEnd
++            ));
++          CpuDeadLoop ();
++        }
++
++        if ((Mmio64Size > 0) && (Mmio64Base < RamEnd) && (RamStart < Mmio64End)) {
++          DEBUG ((
++            DEBUG_ERROR,
++            "CvmDsdt: FATAL - MMIO64 [0x%Lx, 0x%Lx) overlaps RAM [0x%Lx, 0x%Lx)\n",
++            Mmio64Base,
++            Mmio64End,
++            RamStart,
++            RamEnd
++            ));
++          CpuDeadLoop ();
++        }
++      }
++      Hob.Raw = GetNextHob (EFI_HOB_TYPE_RESOURCE_DESCRIPTOR, GET_NEXT_HOB (Hob));
++    }
++  }
++
++  //
++  // Step 3: Make a mutable copy of the compiled DSDT template
++  //
++  DsdtCopy = AllocateCopyPool (DsdtSize, CvmDsdt_aml);
++  if (DsdtCopy == NULL) {
++    return EFI_OUT_OF_RESOURCES;
++  }
++
++  //
++  // Step 3a: Measure the DSDT template BEFORE patching sentinels
++  //
++  // By measuring the unpatched template (with sentinel placeholders),
++  // the RTMR value is identical regardless of PCI MMIO layout — meaning
++  // the same measurement whether the VM has 0, 1, or 8 GPUs.
++  //
++  // This is safe because:
++  //   - The measurement proves the correct DSDT template was installed
++  //   - The MMIO validation code (step 2) still runs and is itself
++  //     measured as part of MRTD (firmware code section)
++  //   - A malicious host cannot skip validation or change the template
++  //
++  // Same pattern as QEMU patch 0002 (static initrd address): measure
++  // a deterministic placeholder, then overwrite with the real value.
++  //
++  TpmMeasureAndLogData (
++    1,
++    EV_PLATFORM_CONFIG_FLAGS,
++    EV_POSTCODE_INFO_ACPI_DATA,
++    ACPI_DATA_LEN,
++    DsdtCopy,
++    DsdtSize
++    );
++
++  //
++  // Step 4: Patch 32-bit MMIO sentinels
++  //
++  Status = PatchDword (
++             DsdtCopy,
++             DsdtSize,
++             CVM_SENTINEL_MMIO32_BASE,
++             (UINT32)Mmio32Base
++             );
++  if (EFI_ERROR (Status)) {
++    goto FreeDsdt;
++  }
++
++  Status = PatchDword (
++             DsdtCopy,
++             DsdtSize,
++             CVM_SENTINEL_MMIO32_LIMIT,
++             (UINT32)(Mmio32Base + Mmio32Size - 1)
++             );
++  if (EFI_ERROR (Status)) {
++    goto FreeDsdt;
++  }
++
++  Status = PatchDword (
++             DsdtCopy,
++             DsdtSize,
++             CVM_SENTINEL_MMIO32_SIZE,
++             (UINT32)Mmio32Size
++             );
++  if (EFI_ERROR (Status)) {
++    goto FreeDsdt;
++  }
++
++  //
++  // Step 5: Patch 64-bit MMIO sentinels
++  //
++  // If no 64-bit window, zero out the sentinels (OS ignores zero-sized window).
++  //
++  Status = PatchQword (
++             DsdtCopy,
++             DsdtSize,
++             CVM_SENTINEL_MMIO64_BASE,
++             (Mmio64Size > 0) ? Mmio64Base : 0
++             );
++  if (EFI_ERROR (Status)) {
++    goto FreeDsdt;
++  }
++
++  Status = PatchQword (
++             DsdtCopy,
++             DsdtSize,
++             CVM_SENTINEL_MMIO64_LIMIT,
++             (Mmio64Size > 0) ? (Mmio64Base + Mmio64Size - 1) : 0
++             );
++  if (EFI_ERROR (Status)) {
++    goto FreeDsdt;
++  }
++
++  Status = PatchQword (
++             DsdtCopy,
++             DsdtSize,
++             CVM_SENTINEL_MMIO64_SIZE,
++             Mmio64Size
++             );
++  if (EFI_ERROR (Status)) {
++    goto FreeDsdt;
++  }
++
++  //
++  // Step 6: Fix DSDT header checksum (patching invalidated it)
++  //
++  Header = (EFI_ACPI_DESCRIPTION_HEADER *)DsdtCopy;
++  if (Header->Length != DsdtSize) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "CvmDsdt: FATAL - template header Length (%u) != blob size (%u)\n",
++      Header->Length,
++      DsdtSize
++      ));
++    Status = EFI_COMPROMISED_DATA;
++    goto FreeDsdt;
++  }
++
++  Header->Checksum = 0;
++  Header->Checksum = CalculateCheckSum8 (DsdtCopy, Header->Length);
++
++  //
++  // Step 7: Install the patched DSDT
++  //
++  // InstallAcpiTable for DSDT automatically updates the FADT's
++  // DSDT and X_DSDT pointer fields.
++  //
++  Status = AcpiProtocol->InstallAcpiTable (
++                           AcpiProtocol,
++                           DsdtCopy,
++                           DsdtSize,
++                           InstalledKey
++                           );
++  if (EFI_ERROR (Status)) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "CvmDsdt: InstallAcpiTable failed: %r\n",
++      Status
++      ));
++    goto FreeDsdt;
++  }
++
++  DEBUG ((
++    DEBUG_INFO,
++    "CvmDsdt: installed reconstructed DSDT (%u bytes)\n",
++    DsdtSize
++    ));
++
++FreeDsdt:
++  FreePool (DsdtCopy);
++  return Status;
++}
+diff --git a/OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.h b/OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.h
+new file mode 100644
+index 0000000..88ee2f7
+--- /dev/null
++++ b/OvmfPkg/Library/AcpiPlatformLib/CvmDsdtRecon.h
+@@ -0,0 +1,57 @@
++/** @file
++  CVM DSDT Reconstructor -- replaces host-provided DSDT/SSDT with
++  a hardcoded, measured, sentinel-patched DSDT.
++
++  Copyright (c) 2025, Kawiri. All rights reserved.
++  SPDX-License-Identifier: BSD-2-Clause-Patent
++**/
++
++#ifndef CVM_DSDT_RECON_H_
++#define CVM_DSDT_RECON_H_
++
++#include <Protocol/AcpiTable.h>
++#include <Uefi/UefiBaseType.h>
++
++/**
++  Check whether an ACPI table carries AML bytecode.
++
++  Returns TRUE for DSDT, SSDT, PSDT, and OSDT — all table types
++  from which Linux/ACPICA loads and executes AML.  A malicious host
++  could inject hostile AML via any of these signatures.
++
++  @param[in] Signature  The 4-byte ACPI table signature.
++
++  @retval TRUE   The signature is an AML-bearing table type.
++  @retval FALSE  Otherwise.
++**/
++BOOLEAN
++CvmIsAmlTable (
++  IN UINT32  Signature
++  );
++
++/**
++  Install the CVM hardcoded DSDT.
++
++  Reads PCI MMIO window PCDs, validates isolation invariants,
++  patches sentinel values in the compiled DSDT template,
++  measures the patched DSDT, and installs it via AcpiProtocol.
++
++  Must be called exactly once, after all host fw_cfg tables
++  have been processed.
++
++  @param[in]  AcpiProtocol   The ACPI table protocol.
++  @param[out] InstalledKey   Receives the installation key.
++
++  @retval EFI_SUCCESS            DSDT installed and measured.
++  @retval EFI_SECURITY_VIOLATION MMIO isolation check failed.
++  @retval EFI_NOT_FOUND          Sentinel not found in template.
++  @retval other                  Installation or measurement error.
++**/
++EFI_STATUS
++EFIAPI
++CvmInstallReconstructedDsdt (
++  IN  EFI_ACPI_TABLE_PROTOCOL  *AcpiProtocol,
++  OUT UINTN                    *InstalledKey
++  );
++
++#endif /* CVM_DSDT_RECON_H_ */
+diff --git a/OvmfPkg/Library/AcpiPlatformLib/DxeAcpiPlatformLib.inf b/OvmfPkg/Library/AcpiPlatformLib/DxeAcpiPlatformLib.inf
+index 59fcb95..9d72313 100644
+--- a/OvmfPkg/Library/AcpiPlatformLib/DxeAcpiPlatformLib.inf
++++ b/OvmfPkg/Library/AcpiPlatformLib/DxeAcpiPlatformLib.inf
+@@ -16,6 +16,8 @@
+ 
+ [Sources]
+   BootScript.c
++  CvmDsdtRecon.c
++  CvmDsdtRecon.h
+   DxeAcpiPlatformLib.c
+   PciDecoding.c
+   QemuFwCfgAcpi.c
+@@ -28,6 +30,7 @@
+ [LibraryClasses]
+   BaseLib
+   DebugLib
++  HobLib
+   PcdLib
+   QemuFwCfgS3Lib
+   UefiBootServicesTableLib
+@@ -38,3 +41,7 @@
+ 
+ [Pcd]
+   gEfiMdeModulePkgTokenSpaceGuid.PcdPciDisableBusEnumeration
++  gUefiOvmfPkgTokenSpaceGuid.PcdPciMmio32Base
++  gUefiOvmfPkgTokenSpaceGuid.PcdPciMmio32Size
++  gUefiOvmfPkgTokenSpaceGuid.PcdPciMmio64Base
++  gUefiOvmfPkgTokenSpaceGuid.PcdPciMmio64Size
+diff --git a/OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c b/OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c
+index d9d0163..36ad412 100644
+--- a/OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c
++++ b/OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c
+@@ -21,6 +21,7 @@
+ #include <Library/QemuFwCfgS3Lib.h>           // QemuFwCfgS3Enabled()
+ #include <Library/UefiBootServicesTableLib.h> // gBS
+ #include <Library/TpmMeasurementLib.h>
++#include "CvmDsdtRecon.h"
+ 
+ //
+ // The user structure for the ordered collection that will track the fw_cfg
+@@ -418,18 +419,25 @@ ProcessCmdAllocate (
+     ));
+
+   //
+-  // Measure the data which is downloaded from QEMU.
+-  // It has to be done before it is consumed. Because the data will
+-  // be updated in the following operations.
++  // CVM: Skip measurement for ALL ACPI blobs from QEMU fw_cfg.
++  //
++  // AML tables (DSDT/SSDT) are discarded — replaced by CvmDsdt.
++  // Non-AML tables (FADT, MADT, MCFG, HPET, etc.) are host-generated
++  // and vary with hardware config (MADT changes with -smp count,
++  // DMAR changes with vIOMMU, etc.).  Measuring them creates
++  // host-dependent RTMR values with no security benefit — a malicious
++  // host controls QEMU and can produce any valid table.
++  //
++  // The only meaningful ACPI measurement is the reconstructed CvmDsdt,
++  // measured deterministically in CvmInstallReconstructedDsdt().
+   //
+-  TpmMeasureAndLogData (
+-    1,
+-    EV_PLATFORM_CONFIG_FLAGS,
+-    EV_POSTCODE_INFO_ACPI_DATA,
+-    ACPI_DATA_LEN,
+-    (VOID *)(UINTN)Blob->Base,
+-    Blob->Size
+-    );
++  DEBUG ((
++    DEBUG_INFO,
++    "%a: CVM: skipping measurement for fw_cfg ACPI blob \"%a\" (0x%x bytes)\n",
++    __func__,
++    Allocate->File,
++    Blob->Size
++    ));
+ 
+   return EFI_SUCCESS;
+ 
+@@ -1028,6 +1046,22 @@ Process2ndPassCmdAddPointer (
+       {
+         return EFI_SUCCESS;
+       }
++
++      //
++      // CVM: Skip all AML-bearing tables (DSDT/SSDT/PSDT/OSDT) — the
++      // host-provided tables are discarded entirely. A hardcoded DSDT
++      // is installed by CvmInstallReconstructedDsdt().
++      //
++      if (CvmIsAmlTable (Header->Signature)) {
++        DEBUG ((
++          DEBUG_INFO,
++          "%a: CVM: discarding host AML table \"%-4.4a\" (0x%x bytes)\n",
++          __func__,
++          (CONST CHAR8 *)&Header->Signature,
++          Header->Length
++          ));
++        return EFI_SUCCESS;
++      }
+     }
+   }
+ 
+@@ -1144,18 +1162,11 @@ InstallQemuFwCfgTables (
+   RestorePciDecoding (OriginalPciAttributes, OriginalPciAttributesCount);
+
+   //
+-  // Measure the "etc/table-loader" which is downloaded from QEMU.
+-  // It has to be done before it is consumed. Because it would be
+-  // updated in the following operations.
++  // CVM: Skip measurement of "etc/table-loader" — this is a host-generated
++  // ACPI table loading script whose content varies with VM configuration
++  // (vCPU count, memory, PCI devices). Same rationale as skipping per-blob
++  // measurements in ProcessCmdAllocate() above.
+   //
+-  TpmMeasureAndLogData (
+-    1,
+-    EV_PLATFORM_CONFIG_FLAGS,
+-    EV_POSTCODE_INFO_ACPI_DATA,
+-    ACPI_DATA_LEN,
+-    (VOID *)(UINTN)LoaderStart,
+-    FwCfgSize
+-    );
+
+   LoaderEnd = LoaderStart + FwCfgSize / sizeof *LoaderEntry;
+
+@@ -1278,6 +1284,35 @@ InstallQemuFwCfgTables (
+     }
+   }
+ 
++  //
++  // CVM: Install the reconstructed DSDT (replaces all host DSDT/SSDT).
++  //
++  if (Installed == INSTALLED_TABLES_MAX) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "%a: CVM: no room for reconstructed DSDT\n",
++      __func__
++      ));
++    Status = EFI_OUT_OF_RESOURCES;
++    goto UninstallAcpiTables;
++  }
++
++  Status = CvmInstallReconstructedDsdt (
++             AcpiProtocol,
++             &InstalledKey[Installed]
++             );
++  if (EFI_ERROR (Status)) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "%a: CVM: CvmInstallReconstructedDsdt(): %r\n",
++      __func__,
++      Status
++      ));
++    goto UninstallAcpiTables;
++  }
++
++  ++Installed;
++
+   //
+   // Install a protocol to notify that the ACPI table provided by Qemu is
+   // ready.
+-- 
+2.43.0
+

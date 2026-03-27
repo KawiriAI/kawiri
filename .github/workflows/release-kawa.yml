@@ -1,0 +1,51 @@
+name: Release kawa
+
+on:
+  push:
+    tags: ['kawa-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kawa
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#kawa-v}"
+          CARGO_VERSION=$(grep '^version' kawa/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag kawa-v${TAG_VERSION} does not match kawa/Cargo.toml version (${CARGO_VERSION})"
+            exit 1
+          fi
+
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+        working-directory: kawa
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          ARCHIVE="kawa-${TAG#kawa-}-linux-x86_64.tar.gz"
+          cp kawa/target/x86_64-unknown-linux-musl/release/kawa kawa-bin
+          tar czf "$ARCHIVE" -C . kawa-bin LICENSE
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            "$ARCHIVE" \
+            "$ARCHIVE.sha256"

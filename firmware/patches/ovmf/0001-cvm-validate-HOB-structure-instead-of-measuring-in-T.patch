@@ -1,0 +1,145 @@
+From 815b1d9c1bf29c6921295412fc8ce89839fd2c72 Mon Sep 17 00:00:00 2001
+From: Kawiri <patches@kawiri.ai>
+Date: Thu, 26 Feb 2026 17:34:19 +0000
+Subject: [PATCH] cvm: validate HOB structure instead of measuring in TDX
+
+Replace the HOB list measurement (hash-and-extend to RTMR0) with
+region-bounded structural validation. The HOB list is host-provided
+and varies by VM configuration, making RTMR values non-deterministic.
+
+TdxHelperMeasureTdHob() is the first code to touch the untrusted
+HOB list (called before ValidateHobList), so all safety checks
+must be self-contained:
+- Every header access is bounds-checked against PcdOvmfSecGhcbSize
+- HobLength must be non-zero, 8-byte aligned, and within region
+- ResourceDescriptor struct access verified against HobLength
+- Physical address overflow detection (no arbitrary size cap)
+
+By not writing to WorkArea.MeasurementsBitmap, the downstream
+InternalBuildGuidHobForTdxMeasurement() naturally skips creating
+the TdHob measurement GuidHob.
+
+Signed-off-by: Kawiri <patches@kawiri.ai>
+---
+ OvmfPkg/IntelTdx/TdxHelperLib/SecTdxHelper.c | 94 ++++++++++++++------
+ 1 file changed, 67 insertions(+), 27 deletions(-)
+
+diff --git a/OvmfPkg/IntelTdx/TdxHelperLib/SecTdxHelper.c b/OvmfPkg/IntelTdx/TdxHelperLib/SecTdxHelper.c
+index e430066..89f3547 100644
+--- a/OvmfPkg/IntelTdx/TdxHelperLib/SecTdxHelper.c
++++ b/OvmfPkg/IntelTdx/TdxHelperLib/SecTdxHelper.c
+@@ -849,44 +849,84 @@ TdxHelperMeasureTdHob (
+   )
+ {
+   EFI_PEI_HOB_POINTERS  Hob;
+-  EFI_STATUS            Status;
+-  UINT8                 Digest[SHA384_DIGEST_SIZE];
+-  OVMF_WORK_AREA        *WorkArea;
+   VOID                  *TdHob;
++  UINT8                 *HobRegionEnd;
+ 
+-  TdHob   = (VOID *)(UINTN)FixedPcdGet32 (PcdOvmfSecGhcbBase);
+-  Hob.Raw = (UINT8 *)TdHob;
++  TdHob        = (VOID *)(UINTN)FixedPcdGet32 (PcdOvmfSecGhcbBase);
++  HobRegionEnd = (UINT8 *)TdHob + FixedPcdGet32 (PcdOvmfSecGhcbSize);
++  Hob.Raw      = (UINT8 *)TdHob;
+ 
+   //
+-  // Walk thru the TdHob list until end of list.
++  // CVM: Validate HOB structure instead of measuring it.
++  // This function runs BEFORE ValidateHobList(), so all safety checks
++  // must be self-contained. The HOB list is host-provided and varies
++  // by VM config, making measurement non-deterministic.
+   //
+-  while (!END_OF_HOB_LIST (Hob)) {
+-    Hob.Raw = GET_NEXT_HOB (Hob);
+-  }
++  while (TRUE) {
++    //
++    // Ensure the HOB header is readable within the allocated region
++    //
++    if ((UINT8 *)Hob.Raw + sizeof (EFI_HOB_GENERIC_HEADER) > HobRegionEnd) {
++      return EFI_SECURITY_VIOLATION;
++    }
+ 
+-  Status = TdxMeasurementHashAndExtendToRtmr (
+-             0,
+-             (UINT8 *)TdHob,
+-             (UINTN)((UINT8 *)Hob.Raw - (UINT8 *)TdHob),
+-             Digest,
+-             SHA384_DIGEST_SIZE
+-             );
++    //
++    // Check for end-of-list sentinel
++    //
++    if (END_OF_HOB_LIST (Hob)) {
++      break;
++    }
+ 
+-  if (EFI_ERROR (Status)) {
+-    return Status;
++    //
++    // HobLength must be non-zero and 8-byte aligned.
++    // Non-zero + 8-byte aligned guarantees HobLength >= 8
++    // == sizeof(EFI_HOB_GENERIC_HEADER).
++    //
++    if (Hob.Header->HobLength == 0) {
++      return EFI_SECURITY_VIOLATION;
++    }
++
++    if ((Hob.Header->HobLength & 0x7) != 0) {
++      return EFI_SECURITY_VIOLATION;
++    }
++
++    //
++    // The next HOB must stay within the allocated region
++    //
++    if ((UINT8 *)Hob.Raw + Hob.Header->HobLength > HobRegionEnd) {
++      return EFI_SECURITY_VIOLATION;
++    }
++
++    //
++    // Validate ResourceDescriptor HOBs: check length matches struct,
++    // and physical address range does not overflow
++    //
++    if (Hob.Header->HobType == EFI_HOB_TYPE_RESOURCE_DESCRIPTOR) {
++      if (Hob.Header->HobLength < sizeof (EFI_HOB_RESOURCE_DESCRIPTOR)) {
++        return EFI_SECURITY_VIOLATION;
++      }
++
++      {
++        UINT64  EndAddress;
++
++        EndAddress = Hob.ResourceDescriptor->PhysicalStart +
++                     Hob.ResourceDescriptor->ResourceLength;
++
++        if (EndAddress < Hob.ResourceDescriptor->PhysicalStart) {
++          return EFI_SECURITY_VIOLATION;
++        }
++      }
++    }
++
++    Hob.Raw = GET_NEXT_HOB (Hob);
+   }
+ 
+   //
+-  // This function is called in SEC phase and at that moment the Hob service
+-  // is not available. So the TdHob measurement value is stored in workarea.
++  // CVM: Do not write measurement to WorkArea. The MeasurementsBitmap
++  // will not have TDX_MEASUREMENT_TDHOB_BITMASK set, so
++  // InternalBuildGuidHobForTdxMeasurement() naturally skips the
++  // TdHob measurement GuidHob.
+   //
+-  WorkArea = (OVMF_WORK_AREA *)FixedPcdGet32 (PcdOvmfWorkAreaBase);
+-  if (WorkArea == NULL) {
+-    return EFI_DEVICE_ERROR;
+-  }
+-
+-  WorkArea->TdxWorkArea.SecTdxWorkArea.TdxMeasurementsData.MeasurementsBitmap |= TDX_MEASUREMENT_TDHOB_BITMASK;
+-  CopyMem (WorkArea->TdxWorkArea.SecTdxWorkArea.TdxMeasurementsData.TdHobHashValue, Digest, SHA384_DIGEST_SIZE);
+ 
+   return EFI_SUCCESS;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

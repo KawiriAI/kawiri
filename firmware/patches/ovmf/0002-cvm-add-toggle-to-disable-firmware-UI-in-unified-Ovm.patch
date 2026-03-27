@@ -1,0 +1,121 @@
+From 01303855de7a364a151db0fd3ae2bc9995df0f7d Mon Sep 17 00:00:00 2001
+From: Kawiri <patches@kawiri.ai>
+Date: Thu, 26 Feb 2026 22:04:51 +0000
+Subject: [PATCH 1/2] cvm: add toggle to disable firmware UI in OvmfPkgX64 and
+ IntelTdxX64 builds
+
+Add BUILD_FIRMWARE_UI define (default TRUE) to both OvmfPkgX64 and
+IntelTdxX64 DSC/FDF files. When set to FALSE, UiApp and
+BootManagerMenuApp are excluded from the firmware volume.
+
+For confidential VM builds, the firmware UI is unused (headless boot)
+and its inclusion adds non-deterministic content to the MRTD/LAUNCH_DIGEST
+measurement. Disabling it reduces the measurement surface.
+
+Signed-off-by: Kawiri <patches@kawiri.ai>
+---
+ OvmfPkg/IntelTdx/IntelTdxX64.dsc |  9 +++++++++
+ OvmfPkg/IntelTdx/IntelTdxX64.fdf |  2 ++
+ OvmfPkg/OvmfPkgX64.dsc           |  9 +++++++++
+ OvmfPkg/OvmfPkgX64.fdf           |  2 ++
+ 4 files changed, 22 insertions(+)
+
+diff --git a/OvmfPkg/OvmfPkgX64.dsc b/OvmfPkg/OvmfPkgX64.dsc
+index 9180e88..4a233f0 100644
+--- a/OvmfPkg/OvmfPkgX64.dsc
++++ b/OvmfPkg/OvmfPkgX64.dsc
+@@ -43,6 +43,13 @@
+   #
+   DEFINE BUILD_SHELL             = TRUE
+
++  #
++  # Firmware UI can be disabled for headless CVM builds to reduce measurement
++  # surface. When FALSE, UiApp and BootManagerMenuApp are excluded from the
++  # firmware volume, making MRTD/LAUNCH_DIGEST independent of UI modules.
++  #
++  DEFINE BUILD_FIRMWARE_UI        = TRUE
++
+   #
+   # Network definition
+   #
+@@ -926,6 +933,7 @@
+       XenPlatformLib|OvmfPkg/Library/XenPlatformLib/XenPlatformLib.inf
+   }
+   MdeModulePkg/Logo/LogoDxe.inf
++!if $(BUILD_FIRMWARE_UI) == TRUE
+   MdeModulePkg/Application/UiApp/UiApp.inf {
+     <LibraryClasses>
+       NULL|MdeModulePkg/Library/DeviceManagerUiLib/DeviceManagerUiLib.inf
+@@ -933,6 +941,7 @@
+       NULL|MdeModulePkg/Library/BootMaintenanceManagerUiLib/BootMaintenanceManagerUiLib.inf
+   }
+   MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenuApp.inf
++!endif
+   OvmfPkg/QemuKernelLoaderFsDxe/QemuKernelLoaderFsDxe.inf {
+     <LibraryClasses>
+       NULL|OvmfPkg/Library/BlobVerifierLibNull/BlobVerifierLibNull.inf
+diff --git a/OvmfPkg/OvmfPkgX64.fdf b/OvmfPkg/OvmfPkgX64.fdf
+index 3eec314..91a0ebf 100644
+--- a/OvmfPkg/OvmfPkgX64.fdf
++++ b/OvmfPkg/OvmfPkgX64.fdf
+@@ -233,8 +233,10 @@ INF  MdeModulePkg/Universal/Console/GraphicsConsoleDxe/GraphicsConsoleDxe.inf
+ INF  MdeModulePkg/Universal/Console/TerminalDxe/TerminalDxe.inf
+ INF  MdeModulePkg/Universal/DriverHealthManagerDxe/DriverHealthManagerDxe.inf
+ INF  MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
++!if $(BUILD_FIRMWARE_UI) == TRUE
+ INF  MdeModulePkg/Application/UiApp/UiApp.inf
+ INF  MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenuApp.inf
++!endif
+ INF  OvmfPkg/QemuKernelLoaderFsDxe/QemuKernelLoaderFsDxe.inf
+ INF  MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
+ INF  MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
+diff --git a/OvmfPkg/IntelTdx/IntelTdxX64.dsc b/OvmfPkg/IntelTdx/IntelTdxX64.dsc
+--- a/OvmfPkg/IntelTdx/IntelTdxX64.dsc
++++ b/OvmfPkg/IntelTdx/IntelTdxX64.dsc
+@@ -37,6 +37,13 @@
+   DEFINE BUILD_SHELL             = TRUE
+
+   #
++  # Firmware UI can be disabled for headless CVM builds to reduce measurement
++  # surface. When FALSE, UiApp and BootManagerMenuApp are excluded from the
++  # firmware volume, making MRTD independent of UI modules.
++  #
++  DEFINE BUILD_FIRMWARE_UI        = TRUE
++
++  #
+   # Device drivers
+   #
+ !include OvmfPkg/Include/Dsc/OvmfOptHwDefines.dsc.inc
+@@ -623,6 +630,7 @@
+       XenPlatformLib|OvmfPkg/Library/XenPlatformLib/XenPlatformLib.inf
+   }
+   MdeModulePkg/Logo/LogoDxe.inf
++!if $(BUILD_FIRMWARE_UI) == TRUE
+   MdeModulePkg/Application/UiApp/UiApp.inf {
+     <LibraryClasses>
+       NULL|MdeModulePkg/Library/DeviceManagerUiLib/DeviceManagerUiLib.inf
+@@ -630,6 +638,7 @@
+       NULL|MdeModulePkg/Library/BootMaintenanceManagerUiLib/BootMaintenanceManagerUiLib.inf
+   }
+   MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenuApp.inf
++!endif
+   OvmfPkg/QemuKernelLoaderFsDxe/QemuKernelLoaderFsDxe.inf {
+     <LibraryClasses>
+       NULL|OvmfPkg/Library/BlobVerifierLibNull/BlobVerifierLibNull.inf
+diff --git a/OvmfPkg/IntelTdx/IntelTdxX64.fdf b/OvmfPkg/IntelTdx/IntelTdxX64.fdf
+--- a/OvmfPkg/IntelTdx/IntelTdxX64.fdf
++++ b/OvmfPkg/IntelTdx/IntelTdxX64.fdf
+@@ -216,8 +216,10 @@
+ INF  MdeModulePkg/Universal/Console/ConSplitterDxe/ConSplitterDxe.inf
+ INF  MdeModulePkg/Universal/Console/TerminalDxe/TerminalDxe.inf
+ INF  MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
++!if $(BUILD_FIRMWARE_UI) == TRUE
+ INF  MdeModulePkg/Application/UiApp/UiApp.inf
+ INF  MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenuApp.inf
++!endif
+ INF  OvmfPkg/QemuKernelLoaderFsDxe/QemuKernelLoaderFsDxe.inf
+ INF  MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
+ INF  MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
+--
+2.43.0
+

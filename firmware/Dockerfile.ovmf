@@ -1,0 +1,111 @@
+# Dockerfile.ovmf — Build OVMF firmware (edk2-stable202511) for CVM
+#
+# Produces firmware images + DSDT artifact:
+#
+#   TEE boot (teehost uses -bios, unified):
+#     OVMF.fd      — unified CODE+VARS (4 MB), used for SNP boot + measurement
+#     OVMF_TDX.fd  — TDX-specific TDVF (4 MB), used for TDX boot + measurement
+#
+#   Non-TEE dev boot (pflash split, writable VARS):
+#     OVMF_CODE.fd — read-only code portion (3.5 MB)
+#     OVMF_VARS.fd — writable variable store (0.5 MB)
+#
+#   DSDT:
+#     CvmDsdt.aml  — compiled ACPI DSDT template (for RTMR0 measurement prediction)
+#
+# IMPORTANT: cvm.toml [manifest.snp] must use OVMF.fd (not OVMF_CODE.fd).
+# The measurement depends on firmware file size and GPA layout. Using the
+# wrong file produces a different launch digest than what teehost boots with.
+#
+# 6 CVM patches for deterministic measurements and ACPI firewall.
+#
+# Usage:
+#   ./build.sh
+
+FROM docker.io/library/ubuntu:24.04 AS builder
+
+ARG EDK2_TAG=edk2-stable202511
+ARG APT_MIRROR=http://snapshot.ubuntu.com
+ARG APT_SNAPSHOT=20260320T000000Z
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
+    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-updates main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-security main restricted universe multiverse"; \
+    } > /etc/apt/sources.list && \
+    { echo 'Acquire::Check-Valid-Until "false";'; \
+      echo 'Acquire::https::Verify-Peer "false";'; \
+    } > /etc/apt/apt.conf.d/99snapshot
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    build-essential python3 bc nasm iasl uuid-dev xxd \
+    git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --depth 1 --branch "${EDK2_TAG}" --recurse-submodules \
+    https://github.com/tianocore/edk2.git
+
+COPY patches/ovmf/*.patch /patches/
+
+# Normalize CRLF → LF (edk2 uses CRLF, our patches use LF)
+RUN cd edk2 \
+    && find . -type f \( -name '*.c' -o -name '*.h' -o -name '*.inf' -o -name '*.dsc' -o -name '*.fdf' \) \
+        -exec sed -i 's/\r$//' {} +
+
+RUN cd edk2 \
+    && for p in /patches/*.patch; do patch -p1 < "$p"; done \
+    && sed -i '/gUefiOvmfPkgTokenSpaceGuid.PcdOvmfSecGhcbBase/a\  gUefiOvmfPkgTokenSpaceGuid.PcdOvmfSecGhcbSize' \
+        OvmfPkg/IntelTdx/TdxHelperLib/SecTdxHelperLib.inf \
+    && cd OvmfPkg/Library/AcpiPlatformLib \
+    && iasl -vw 6049 CvmDsdt.asl \
+    && xxd -i CvmDsdt.aml > CvmDsdtTemplate.h
+
+# Build BaseTools
+RUN cd edk2 \
+    && export PYTHON_COMMAND=python3 \
+    && make -C BaseTools -j"$(nproc)" PYTHON_COMMAND=python3
+
+# Build unified OVMF firmware (Config-A: KVM + SEV-SNP + TDX)
+RUN cd edk2 \
+    && export PYTHON_COMMAND=python3 \
+    && export WORKSPACE="$PWD" \
+    && . ./edksetup.sh BaseTools \
+    && build \
+        -a X64 \
+        -b RELEASE \
+        -t GCC5 \
+        -p OvmfPkg/OvmfPkgX64.dsc \
+        -n "$(nproc)" \
+        -D SECURE_BOOT_ENABLE=TRUE \
+        -D CC_MEASUREMENT_ENABLE=TRUE \
+        -D FD_SIZE_4MB \
+        -D BUILD_FIRMWARE_UI=FALSE \
+        -D BUILD_SMBIOS=FALSE
+
+# Build TDX-specific TDVF firmware (OvmfPkg/IntelTdx — required for TDX guests)
+RUN cd edk2 \
+    && export PYTHON_COMMAND=python3 \
+    && export WORKSPACE="$PWD" \
+    && . ./edksetup.sh BaseTools \
+    && build \
+        -a X64 \
+        -b RELEASE \
+        -t GCC5 \
+        -p OvmfPkg/IntelTdx/IntelTdxX64.dsc \
+        -n "$(nproc)" \
+        -D SECURE_BOOT_ENABLE=FALSE \
+        -D BUILD_FIRMWARE_UI=FALSE \
+        -D BUILD_SMBIOS=FALSE
+
+RUN find /src/edk2/Build -name "OVMF*.fd" -exec ls -la {} \;
+
+FROM scratch
+COPY --from=builder /src/edk2/Build/OvmfX64/RELEASE_GCC5/FV/OVMF.fd /OVMF.fd
+COPY --from=builder /src/edk2/Build/OvmfX64/RELEASE_GCC5/FV/OVMF_CODE.fd /OVMF_CODE.fd
+COPY --from=builder /src/edk2/Build/OvmfX64/RELEASE_GCC5/FV/OVMF_VARS.fd /OVMF_VARS.fd
+COPY --from=builder /src/edk2/Build/IntelTdx/RELEASE_GCC5/FV/OVMF.fd /OVMF_TDX.fd
+COPY --from=builder /src/edk2/OvmfPkg/Library/AcpiPlatformLib/CvmDsdt.aml /CvmDsdt.aml

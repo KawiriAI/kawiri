@@ -1,0 +1,147 @@
+# cvm-gpu-base — shared GPU base for all NVIDIA CC CVM images
+#
+# Extends cvm-base with NVIDIA Confidential Computing support:
+#   - Canonical-signed open-source kernel modules (nvidia.ko, nvidia-uvm.ko)
+#   - NVIDIA userspace driver (from .run installer, no kernel modules)
+#   - Module loading chain for SPDM/LKCA GPU attestation
+#   - nvidia-uvm loader service (retries for CC mode init)
+#
+# Build with: just build-gpu-base
+# Requires: cvm-base:latest
+
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:67efaecc0031a612cf7bb3c863407018dbbef0a971f62032b77aa542ac8ac0d2
+ARG NVIDIA_DRIVER_VERSION=590.48.01
+ARG NVIDIA_MODULES_PKG=linux-modules-nvidia-590-open-6.17.0-14-generic
+
+# ============================================================
+# Stage 1: Download NVIDIA userspace driver
+# ============================================================
+
+FROM ${UBUNTU_IMAGE} AS driver-download
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+ARG NVIDIA_DRIVER_VERSION
+RUN curl -fsSL -o /tmp/NVIDIA-Linux-x86_64.run \
+    "https://us.download.nvidia.com/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run" && \
+    chmod +x /tmp/NVIDIA-Linux-x86_64.run
+
+# ============================================================
+# Stage 2: GPU base image (cvm-base + NVIDIA CC stack)
+# ============================================================
+
+FROM cvm-base:latest AS final
+
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG NVIDIA_DRIVER_VERSION
+ARG NVIDIA_MODULES_PKG
+
+# Canonical-signed NVIDIA open-source kernel modules + GPU utilities
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    kmod pciutils \
+    ${NVIDIA_MODULES_PKG} \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+# Verify NVIDIA modules are signed (fail the build if not)
+RUN KVER=$(ls /lib/modules/ | sort -V | tail -1) && \
+    for ko in $(find /lib/modules/${KVER} -name 'nvidia*.ko*' ! -name 'nvidia*fb*' ! -name 'nvidia-wmi*'); do \
+        if ! tail -c 28 "$ko" | grep -q 'Module signature appended'; then \
+            echo "FATAL: unsigned module: $ko" >&2; exit 1; \
+        fi; \
+        echo "  signed: $(basename $ko)"; \
+    done
+
+# --- Install NVIDIA userspace driver (no kernel modules) ---
+COPY --from=driver-download /tmp/NVIDIA-Linux-x86_64.run /tmp/
+RUN /tmp/NVIDIA-Linux-x86_64.run \
+    --silent \
+    --no-kernel-modules \
+    --no-drm \
+    --no-opengl-files \
+    --no-wine-files \
+    --no-distro-scripts \
+    --no-nouveau-check \
+    --no-rebuild-initramfs \
+    --no-backup \
+    && rm -f /tmp/NVIDIA-Linux-x86_64.run
+
+# --- NVIDIA module loading and dependency chain ---
+# ecdsa_generic + ecdh must be available before nvidia.ko loads, otherwise
+# the SPDM secure channel to the GPU TEE cannot be established.
+# nvidia-uvm must load AFTER nvidia.ko's module_init() (PCI probe) completes,
+# because nvidia-uvm registers with nvidia's RM which isn't ready until probe
+# finishes. Using softdep post: ensures modprobe waits for nvidia to fully
+# initialize before loading nvidia-uvm, avoiding the race where udev-triggered
+# nvidia loading and systemd-modules-load run concurrently.
+RUN printf 'ecdsa_generic\necdh\n' > /etc/modules-load.d/lkca-gpu-cc.conf && \
+    printf 'softdep nvidia pre: ecdsa_generic ecdh post: nvidia-uvm\n' > /etc/modprobe.d/nvidia-deps.conf && \
+    printf 'nvidia\nnvidia-uvm\n' > /etc/modules-load.d/nvidia-gpu.conf
+
+# --- nvidia-uvm loader with retry ---
+# nvidia.ko's PCI probe takes several seconds on H100 in CC mode (firmware
+# handshake, SPDM channel). nvidia-uvm registration fails if RM isn't ready.
+# This script retries with backoff, runs BEFORE lock-modules.service.
+COPY <<'SCRIPT' /usr/local/lib/kawiri/load-nvidia-uvm.py
+#!/usr/bin/python3 -I
+"""Load nvidia-uvm and create device nodes (runs as root).
+
+CC ready state is set by kawa's GPU attestation flow (SET_GPUS_STATE RM ioctl),
+not by nvidia-smi conf-compute. Do NOT call conf-compute -srs here — it can
+put the GPU device in a transient bad state (EIO) that breaks the inference engine.
+"""
+import subprocess, time, sys
+
+# Step 1: Load nvidia-uvm module (retries for GPU init in CC mode)
+for attempt in range(30):
+    ret = subprocess.run(
+        ["/usr/bin/nvidia-modprobe", "-u", "-c0"],
+        capture_output=True,
+    )
+    if ret.returncode == 0:
+        subprocess.run(["/usr/bin/nvidia-modprobe", "-c0", "-i", "0"])
+        print(f"nvidia-uvm loaded (attempt {attempt + 1})", flush=True)
+        break
+    time.sleep(1)
+else:
+    print("FATAL: nvidia-uvm failed to load after 30 attempts", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+# Step 2: Wait for nvidia-smi to confirm GPU is accessible
+for attempt in range(30):
+    ret = subprocess.run(
+        ["/usr/bin/nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if ret.returncode == 0 and ret.stdout.strip():
+        print(f"GPU accessible: {ret.stdout.strip()}", flush=True)
+        break
+    time.sleep(2)
+else:
+    print("WARNING: nvidia-smi not responding after 60s", file=sys.stderr, flush=True)
+
+sys.exit(0)
+SCRIPT
+RUN chmod 755 /usr/local/lib/kawiri/load-nvidia-uvm.py
+
+COPY <<'UNIT' /etc/systemd/system/nvidia-uvm-load.service
+[Unit]
+Description=Load nvidia-uvm and create device nodes
+After=systemd-modules-load.service systemd-udevd.service
+Before=lock-modules.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I /usr/local/lib/kawiri/load-nvidia-uvm.py
+TimeoutStartSec=60
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+RUN systemctl enable nvidia-uvm-load.service

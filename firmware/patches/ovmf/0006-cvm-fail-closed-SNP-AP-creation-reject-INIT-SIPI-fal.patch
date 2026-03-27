@@ -1,0 +1,168 @@
+From 10965aaa88dcafb73d7a5cb8b9ec1532b6984ea7 Mon Sep 17 00:00:00 2001
+From: Kawiri <patches@kawiri.ai>
+Date: Fri, 28 Feb 2026 18:30:00 +0100
+Subject: [PATCH] cvm: SNP AP creation via CPUID-derived APIC IDs
+
+When the hypervisor does not support GHCB_HV_FEATURES_APIC_ID_LIST
+(BIT4) --- which no current hypervisor implements --- derive APIC IDs
+from the SNP-measured CPUID 0xB topology leaf and build the APIC ID
+list HOB that MpInitLib expects.
+
+This preserves the security hardening (INIT/SIPI fallback is still
+rejected under SEV-SNP) while allowing multi-vCPU SNP VMs to boot
+with current KVM, which does support AP_CREATION (BIT1).
+
+APIC IDs are enumerated as 0..N-1 where N = CPUID 0xB sub-leaf 1
+EBX[15:0] (logical processors per package, from the measured CPUID
+table).  This is correct for single-socket QEMU topologies.
+
+The CPUID 0xB EBX value comes from the SNP-validated CPUID table
+(measured into the launch digest).  EDX (per-vCPU APIC ID from
+hypervisor) is not used.  KVM validates each APIC ID at
+VMGEXIT(AP_CREATION) time --- wrong IDs are rejected.
+
+Additionally harden CanUseSevSnpCreateAP() and SevSnpCreateAP()
+with defense-in-depth: halt if the APIC ID HOB is missing or the
+list is empty/NULL.
+
+Signed-off-by: Kawiri <patches@kawiri.ai>
+---
+ OvmfPkg/PlatformPei/AmdSev.c              | 65 ++++++++++++++++++++++-
+ UefiCpuPkg/Library/MpInitLib/X64/AmdSev.c | 30 +++++++++-
+ 2 files changed, 93 insertions(+), 2 deletions()
+
+diff --git a/OvmfPkg/PlatformPei/AmdSev.c b/OvmfPkg/PlatformPei/AmdSev.c
+--- a/OvmfPkg/PlatformPei/AmdSev.c
++++ b/OvmfPkg/PlatformPei/AmdSev.c
+@@ -114,6 +114,65 @@
+ }
+ 
+ /**
++  Derive APIC IDs from the SNP-measured CPUID 0xB topology leaf.
++
++  When the hypervisor does not advertise GHCB_HV_FEATURES_APIC_ID_LIST
++  (BIT4), we cannot retrieve APIC IDs via VMGEXIT(GET_APIC_IDS).
++  Instead, read the logical processor count from CPUID 0xB sub-leaf 1
++  (core level) EBX[15:0] --- this value comes from the SNP-validated
++  CPUID table and is part of the launch digest.
++
++  APIC IDs are enumerated as 0..N-1 (contiguous), which is correct
++  for all single-socket QEMU topologies.  The resulting HOB is
++  consumed by MpInitLib's SevSnpCreateAP() identically to the
++  hypervisor-provided list.
++
++**/
++STATIC
++VOID
++AmdSevSnpDeriveApicIds (
++  VOID
++  )
++{
++  UINT32         Ebx;
++  UINT32         NumCpus;
++  GHCB_APIC_IDS  *ApicIds;
++  UINT64         GuidData;
++  UINT32         Index;
++
++  //
++  // CPUID 0xB sub-leaf 1 (core level): EBX[15:0] = logical processors
++  // per package.  For single-socket (standard CVM), this equals the
++  // total vCPU count.  The value is from the measured CPUID table.
++  //
++  AsmCpuidEx (0x0B, 1, NULL, &Ebx, NULL, NULL);
++  NumCpus = Ebx & 0xFFFF;
++
++  if (NumCpus == 0) {
++    DEBUG ((DEBUG_ERROR,
++      "SNP: CPUID 0xB topology unavailable, cannot derive APIC IDs\n"));
++    CpuDeadLoop ();
++  }
++
++  ApicIds = AllocatePool (sizeof (UINT32) + NumCpus * sizeof (UINT32));
++  if (ApicIds == NULL) {
++    DEBUG ((DEBUG_ERROR, "SNP: APIC ID allocation failed --- halting\n"));
++    CpuDeadLoop ();
++  }
++
++  ApicIds->NumEntries = NumCpus;
++  for (Index = 0; Index < NumCpus; Index++) {
++    ApicIds->ApicIds[Index] = Index;
++  }
++
++  GuidData = (UINT64)(UINTN)ApicIds;
++  BuildGuidDataHob (&gGhcbApicIdsGuid, &GuidData, sizeof (GuidData));
++
++  DEBUG ((DEBUG_INFO,
++    "SNP: Derived %u APIC IDs from CPUID topology\n", NumCpus));
++}
++
++/**
+   Initialize SEV-SNP support if running as an SEV-SNP guest.
+ 
+ **/
+@@ -164,9 +220,13 @@
+   //
+   // Retrieve the APIC IDs if the hypervisor supports it. These will be used
+   // to always start APs using SNP AP Create.
++  // If the hypervisor lacks APIC_ID_LIST support, derive IDs from the
++  // measured CPUID topology instead.
+   //
+   if ((HvFeatures & GHCB_HV_FEATURES_APIC_ID_LIST) == GHCB_HV_FEATURES_APIC_ID_LIST) {
+     AmdSevSnpGetApicIds ();
++  } else {
++    AmdSevSnpDeriveApicIds ();
+   }
+ }
+ 
+diff --git a/UefiCpuPkg/Library/MpInitLib/X64/AmdSev.c b/UefiCpuPkg/Library/MpInitLib/X64/AmdSev.c
+--- a/UefiCpuPkg/Library/MpInitLib/X64/AmdSev.c
++++ b/UefiCpuPkg/Library/MpInitLib/X64/AmdSev.c
+@@ -301,7 +301,23 @@
+       // HOB when InitFlag is ApInitConfig.
+       //
+       GuidHob     = GetFirstGuidHob (&gGhcbApicIdsGuid);
++      if (GuidHob == NULL) {
++        DEBUG ((DEBUG_ERROR, "FATAL: APIC ID HOB missing --- halting\n"));
++        CpuDeadLoop ();
++      }
+       GhcbApicIds = (GHCB_APIC_IDS *)(*(UINTN *)GET_GUID_HOB_DATA (GuidHob));
++
++      //
++      // Validate APIC ID list before use.  The data may originate from
++      // VMGEXIT(GET_APIC_IDS) or CPUID-derived enumeration --- either
++      // way, verify it is non-empty before proceeding.
++      //
++      if ((GhcbApicIds == NULL) || (GhcbApicIds->NumEntries == 0)) {
++        DEBUG ((DEBUG_ERROR,
++          "FATAL: SEV-SNP APIC ID list is empty or NULL --- halting\n"));
++        CpuDeadLoop ();
++      }
++
+       MaxIndex    = MIN (GhcbApicIds->NumEntries, PcdGet32 (PcdCpuMaxLogicalProcessorNumber));
+ 
+       //
+@@ -378,7 +394,19 @@
+   }
+ 
+   if ((CpuMpData->InitFlag == ApInitConfig) && (GetFirstGuidHob (&gGhcbApicIdsGuid) == NULL)) {
+-    return FALSE;
++    //
++    // FAIL CLOSED: Under SEV-SNP, INIT/SIPI fallback is unsafe.
++    // A malicious hypervisor can clear GHCB_HV_FEATURES_APIC_ID_LIST
++    // to prevent the APIC ID HOB from being built, forcing MpInitLib
++    // to fall back to INIT/SIPI.  With BSP-only VMSA measurement,
++    // this would cause APs to execute from unmeasured, host-owned VMSAs.
++    // Even without BSP-only measurement, INIT/SIPI under SNP is
++    // architecturally incorrect --- halt unconditionally.
++    //
++    DEBUG ((DEBUG_ERROR,
++      "FATAL: SEV-SNP enabled but APIC ID list HOB missing --- "
++      "INIT/SIPI fallback is unsafe, halting\n"));
++    CpuDeadLoop ();
+   }
+ 
+   return TRUE;
+
+-- 
+2.43.0
+

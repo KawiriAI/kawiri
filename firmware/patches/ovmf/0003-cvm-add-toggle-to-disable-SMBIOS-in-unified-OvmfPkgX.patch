@@ -1,0 +1,157 @@
+From e0a313958f109dbf0cfbbd4045e930bac494cef5 Mon Sep 17 00:00:00 2001
+From: Kawiri <patches@kawiri.ai>
+Date: Thu, 26 Feb 2026 22:05:34 +0000
+Subject: [PATCH 2/2] cvm: add toggle to disable SMBIOS in OvmfPkgX64 and
+ IntelTdxX64 builds
+
+Add BUILD_SMBIOS define (default TRUE) to both OvmfPkgX64 and
+IntelTdxX64 DSC/FDF files. When set to FALSE, SmbiosDxe,
+SmbiosPlatformDxe, and SmbiosMeasurementDxe are excluded from the
+firmware volume.
+
+SMBIOS tables are host-provided and non-deterministic. Their content
+varies by hypervisor version, VM configuration, and host hardware.
+Including them in the firmware makes MRTD/LAUNCH_DIGEST measurements
+host-dependent, preventing reproducible attestation.
+
+Signed-off-by: Kawiri <patches@kawiri.ai>
+---
+ OvmfPkg/IntelTdx/IntelTdxX64.dsc | 11 +++++++++++
+ OvmfPkg/IntelTdx/IntelTdxX64.fdf |  4 ++++
+ OvmfPkg/OvmfPkgX64.dsc           | 11 +++++++++++
+ OvmfPkg/OvmfPkgX64.fdf           |  4 ++++
+ 4 files changed, 30 insertions(+)
+
+diff --git a/OvmfPkg/OvmfPkgX64.dsc b/OvmfPkg/OvmfPkgX64.dsc
+index 4a233f0..6731042 100644
+--- a/OvmfPkg/OvmfPkgX64.dsc
++++ b/OvmfPkg/OvmfPkgX64.dsc
+@@ -50,6 +50,13 @@
+   #
+   DEFINE BUILD_FIRMWARE_UI        = TRUE
+
++  #
++  # SMBIOS tables are host-provided and non-deterministic. Disabling them
++  # removes SmbiosDxe, SmbiosPlatformDxe, and SmbiosMeasurementDxe from
++  # the firmware, making measurements independent of host SMBIOS data.
++  #
++  DEFINE BUILD_SMBIOS             = TRUE
++
+   #
+   # Network definition
+   #
+@@ -1002,11 +1009,13 @@
+   #
+   # SMBIOS Support
+   #
++!if $(BUILD_SMBIOS) == TRUE
+   MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf {
+     <LibraryClasses>
+       NULL|OvmfPkg/Library/SmbiosVersionLib/DetectSmbiosVersionLib.inf
+   }
+   OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.inf
++!endif
+
+   #
+   # ACPI Support
+@@ -1185,6 +1194,8 @@
+   #
+   # Smbios Measurement support
+   #
++!if $(BUILD_SMBIOS) == TRUE
+ !if $(TPM2_ENABLE) == TRUE || $(CC_MEASUREMENT_ENABLE) == TRUE
+   MdeModulePkg/Universal/SmbiosMeasurementDxe/SmbiosMeasurementDxe.inf
+ !endif
++!endif
+diff --git a/OvmfPkg/OvmfPkgX64.fdf b/OvmfPkg/OvmfPkgX64.fdf
+index 91a0ebf..60848c5 100644
+--- a/OvmfPkg/OvmfPkgX64.fdf
++++ b/OvmfPkg/OvmfPkgX64.fdf
+@@ -259,8 +259,10 @@ INF  MdeModulePkg/Bus/Pci/PciSioSerialDxe/PciSioSerialDxe.inf
+ !endif
+ INF  MdeModulePkg/Bus/Isa/Ps2KeyboardDxe/Ps2KeyboardDxe.inf
+
++!if $(BUILD_SMBIOS) == TRUE
+ INF  MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf
+ INF  OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.inf
++!endif
+
+ INF  MdeModulePkg/Universal/Acpi/AcpiTableDxe/AcpiTableDxe.inf
+ INF  OvmfPkg/AcpiPlatformDxe/AcpiPlatformDxe.inf
+@@ -388,9 +390,11 @@ INF OvmfPkg/Tcg/TdTcg2Dxe/TdTcg2Dxe.inf
+   #
+   # Smbios Measurement support
+   #
++!if $(BUILD_SMBIOS) == TRUE
+ !if $(TPM2_ENABLE) == TRUE || $(CC_MEASUREMENT_ENABLE) == TRUE
+ INF MdeModulePkg/Universal/SmbiosMeasurementDxe/SmbiosMeasurementDxe.inf
+ !endif
++!endif
+
+ ################################################################################
+
+diff --git a/OvmfPkg/IntelTdx/IntelTdxX64.dsc b/OvmfPkg/IntelTdx/IntelTdxX64.dsc
+--- a/OvmfPkg/IntelTdx/IntelTdxX64.dsc
++++ b/OvmfPkg/IntelTdx/IntelTdxX64.dsc
+@@ -44,6 +44,13 @@
+   DEFINE BUILD_FIRMWARE_UI        = TRUE
+
+   #
++  # SMBIOS tables are host-provided and non-deterministic. Disabling them
++  # removes SmbiosDxe, SmbiosPlatformDxe, and SmbiosMeasurementDxe from
++  # the firmware, making measurements independent of host SMBIOS data.
++  #
++  DEFINE BUILD_SMBIOS             = TRUE
++
++  #
+   # Device drivers
+   #
+ !include OvmfPkg/Include/Dsc/OvmfOptHwDefines.dsc.inc
+@@ -701,11 +708,13 @@
+   #
+   # SMBIOS Support
+   #
++!if $(BUILD_SMBIOS) == TRUE
+   MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf {
+     <LibraryClasses>
+       NULL|OvmfPkg/Library/SmbiosVersionLib/DetectSmbiosVersionLib.inf
+   }
+   OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.inf
++!endif
+
+   #
+   # ACPI Support
+@@ -768,4 +777,6 @@
+   #
+   # Smbios Measurement support
+   #
++!if $(BUILD_SMBIOS) == TRUE
+   MdeModulePkg/Universal/SmbiosMeasurementDxe/SmbiosMeasurementDxe.inf
++!endif
+diff --git a/OvmfPkg/IntelTdx/IntelTdxX64.fdf b/OvmfPkg/IntelTdx/IntelTdxX64.fdf
+--- a/OvmfPkg/IntelTdx/IntelTdxX64.fdf
++++ b/OvmfPkg/IntelTdx/IntelTdxX64.fdf
+@@ -236,8 +236,10 @@
+ INF  OvmfPkg/SioBusDxe/SioBusDxe.inf
+ INF  MdeModulePkg/Bus/Pci/PciSioSerialDxe/PciSioSerialDxe.inf
+
++!if $(BUILD_SMBIOS) == TRUE
+ INF  MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf
+ INF  OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.inf
++!endif
+
+ INF  MdeModulePkg/Universal/Acpi/AcpiTableDxe/AcpiTableDxe.inf
+ INF  OvmfPkg/AcpiPlatformDxe/AcpiPlatformDxe.inf
+@@ -265,7 +267,9 @@
+   #
+   # Smbios Measurement support
+   #
++!if $(BUILD_SMBIOS) == TRUE
+ INF MdeModulePkg/Universal/SmbiosMeasurementDxe/SmbiosMeasurementDxe.inf
++!endif
+
+ ################################################################################
+
+--
+2.43.0
+

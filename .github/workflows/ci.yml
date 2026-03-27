@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    tags: ['kawa-v*', 'konnect-v*', 'ovmf-v*']
+
+jobs:
+  kawa:
+    name: kawa (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kawa
+
+      - run: cargo fmt --check
+        working-directory: kawa
+
+      - run: cargo clippy -- -D warnings
+        working-directory: kawa
+
+      - run: cargo test
+        working-directory: kawa
+
+  konnect:
+    name: konnect (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+        working-directory: konnect
+
+      - run: bunx tsc --noEmit
+        working-directory: konnect
+
+      - run: bunx biome check .
+        working-directory: konnect
+
+      - run: bun test core/test/ katt/test/
+        working-directory: konnect

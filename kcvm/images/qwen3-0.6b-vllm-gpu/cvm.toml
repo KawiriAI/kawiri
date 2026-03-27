@@ -1,0 +1,154 @@
+# CVM image configuration — kawiri-cvm (GPU)
+# Built by cvmbuild (pure Rust CVM image builder)
+
+[image]
+id = "qwen3-0.6b-vllm-gpu"
+version = "0.1.0"
+base = "Dockerfile"
+context = "../.."
+base_image = "cvm-gpu-base:latest"
+base_image_dockerfile = "base-image/Dockerfile.gpu"
+
+[kernel]
+cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd"
+initrd_modules = ["dm-verity", "dm-mod", "dm-bufio", "squashfs", "virtio-blk", "virtio-pci", "virtio-net", "virtio-scsi", "nf_tables", "nfnetlink", "nf_conntrack", "vfio-pci", "ecdsa_generic", "ecdh"]
+
+[verity]
+enabled = true
+panic_on_corruption = true
+
+[security]
+remove = ["bash", "sh", "dash", "csh", "tcsh", "zsh", "fish", "ksh", "rbash", "busybox", "apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "dpkg", "dpkg-deb", "dpkg-query", "pip", "pip3", "dmsetup"]
+remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg", "/usr/lib/python3/dist-packages/pip"]
+lock_modules = true
+
+[firewall]
+inbound = [{ port = 8443, proto = "tcp" }]
+outbound = "deny"
+
+[[verity_disks]]
+name = "models"
+device = "vdb"
+mountpoint = "/mnt/models"
+description = "model weights disk"
+source = "disks/models"
+
+[[verity_disks]]
+name = "config"
+device = "vdc"
+mountpoint = "/mnt/config"
+description = "configuration disk"
+
+# Runtime environment variables — written to config.env on the config verity disk
+[config_env]
+VLLM_MODEL = "/mnt/models/Qwen3-0.6B"
+VLLM_SERVED_MODEL_NAME = "Qwen3-0.6B"
+VLLM_MAX_MODEL_LEN = "2048"
+VLLM_MAX_NUM_SEQS = "4"
+ENABLE_PQ = "true"
+VLLM_TP_SIZE = "1"
+VLLM_GPU_MEM_UTIL = "0.90"
+
+# Models — downloaded by `just download <image>`
+[[models]]
+repo = "Qwen/Qwen3-0.6B"
+
+# Services
+[services]
+
+[services.network]
+ntp_servers = ["162.159.200.1", "162.159.200.123"]
+
+[[services.groups]]
+name = "vllm-ipc"
+
+[[services.mounts]]
+what = "configfs"
+where = "/sys/kernel/config"
+type = "configfs"
+description = "Kernel Configuration File System"
+condition_path_exists = "/sys/kernel/config"
+
+[[services.units]]
+name = "vllm"
+description = "vLLM GPU inference engine"
+exec = "/usr/local/bin/vllm-launcher"
+after = ["verity-config.service", "verity-models.service", "lock-modules.service", "kawa.service"]
+requires = ["verity-config.service", "verity-models.service"]
+wants = ["kawa.service"]
+environment_file = "/mnt/config/config.env"
+environment = ["DO_NOT_TRACK=1", "HOME=/run/vllm"]
+unset_environment = ["LD_PRELOAD", "PYTHONPATH"]
+hardening = "full"
+user = "vllm"
+group = "vllm-ipc"
+supplementary_groups = ["video", "render"]
+extra_options = [
+  "SystemCallFilter=@system-service @resources @ipc ioctl mmap mprotect",
+  "RestrictNamespaces=no",
+  "RuntimeDirectory=vllm",
+  "RuntimeDirectoryMode=0750",
+  "UMask=0007",
+  "TimeoutStartSec=1800",
+  "StartLimitBurst=3",
+  "StartLimitIntervalSec=120",
+  "DeviceAllow=/dev/nvidia0 rw",
+  "DeviceAllow=/dev/nvidiactl rw",
+  "DeviceAllow=/dev/nvidia-uvm rw",
+  "DeviceAllow=/dev/nvidia-uvm-tools rw",
+  "MemoryDenyWriteExecute=no",
+  "PrivateDevices=no",
+]
+
+[[services.units]]
+name = "nvidia-persistenced"
+description = "NVIDIA Persistence Daemon (keeps SPDM session alive for GPU CC attestation)"
+exec = "/usr/bin/nvidia-persistenced --uvm-persistence-mode --verbose"
+after = ["lock-modules.service"]
+hardening = "minimal"
+read_write_paths = ["/run"]
+device_allow = ["/dev/nvidia0 rw", "/dev/nvidiactl rw"]
+extra_options = [
+  "PrivateDevices=no",
+  "StartLimitBurst=3",
+  "StartLimitIntervalSec=60",
+]
+
+[[services.units]]
+name = "kawa"
+description = "Kawa Noise_XX TLS proxy"
+exec = "/usr/local/bin/kawa"
+after = ["verity-config.service", "sys-kernel-config.mount", "network-online.target", "lock-modules.service", "nvidia-persistenced.service"]
+requires = ["verity-config.service", "sys-kernel-config.mount"]
+wants = ["network-online.target", "vllm.service", "nvidia-persistenced.service"]
+environment_file = "/mnt/config/config.env"
+unset_environment = ["LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "NODE_OPTIONS"]
+hardening = "full"
+supplementary_groups = ["vllm-ipc"]
+read_write_paths = ["/sys/kernel/config"]
+device_allow = ["/dev/sev-guest rw", "/dev/tdx-guest rw", "/dev/nvidiactl rw", "/dev/nvidia0 rw"]
+extra_options = [
+  "MemoryDenyWriteExecute=yes",
+  "InaccessiblePaths=/dev/shm",
+  "ProtectKernelTunables=no",
+  "PrivateDevices=no",
+  "StartLimitBurst=5",
+  "StartLimitIntervalSec=60",
+]
+
+[manifest]
+
+[manifest.snp]
+guest_features = 1
+ovmf_file = "OVMF.fd"
+
+[manifest.tdx]
+ovmf_file = "OVMF-TDX.fd"
+
+# Security assertion profile
+[assert]
+profile = "production"
+# kawa: ProtectKernelTunables=no for /sys/kernel/config (configfs-tsm attestation)
+# kawa: PrivateDevices=no for /dev/nvidiactl + /dev/nvidia0 (GPU CC attestation ioctls)
+# vllm: MemoryDenyWriteExecute=no for CUDA JIT, PrivateDevices=no for GPU access
+exclude = ["service_no_protect_kernel_tunables_off", "service_no_memory_deny_off"]

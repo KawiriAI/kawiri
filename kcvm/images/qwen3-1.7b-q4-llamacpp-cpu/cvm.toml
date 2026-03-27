@@ -1,0 +1,117 @@
+# CVM image configuration — Qwen3-1.7B llama.cpp Q4 CPU inference
+# Built by cvmbuild (pure Rust CVM image builder)
+
+[image]
+id = "qwen3-1.7b-q4-llamacpp-cpu"
+version = "0.1.0"
+base = "Dockerfile"
+context = "../.."
+base_image = "cvm-base:latest"
+base_image_dockerfile = "base-image/Dockerfile"
+
+[kernel]
+cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd"
+initrd_modules = ["dm-verity", "dm-mod", "dm-bufio", "squashfs", "virtio-blk", "virtio-pci", "virtio-net", "virtio-scsi", "nf_tables", "nfnetlink", "nf_conntrack"]
+
+[verity]
+enabled = true
+panic_on_corruption = true
+
+[security]
+remove = ["bash", "sh", "dash", "csh", "tcsh", "zsh", "fish", "ksh", "rbash", "busybox", "apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "dpkg", "dpkg-deb", "dpkg-query", "pip", "pip3", "dmsetup"]
+remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"]
+lock_modules = true
+
+[firewall]
+inbound = [{ port = 8443, proto = "tcp" }]
+outbound = "deny"
+
+[[verity_disks]]
+name = "models"
+device = "vdb"
+mountpoint = "/mnt/models"
+description = "model weights disk"
+source = "disks/models"
+
+[[verity_disks]]
+name = "config"
+device = "vdc"
+mountpoint = "/mnt/config"
+description = "configuration disk"
+
+# Runtime environment variables — written to config.env on the config verity disk
+[config_env]
+LLAMACPP_MODEL = "/mnt/models/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_0.gguf"
+LLAMACPP_THREADS = "4"
+UPSTREAM_URL = "http://127.0.0.1:8080"
+ENABLE_PQ = "true"
+
+# Models — auto-downloaded during `cvmbuild build`
+[[models]]
+repo = "unsloth/Qwen3-1.7B-GGUF"
+include = ["*Q4_0*"]
+
+# Services
+[services]
+
+[services.network]
+ntp_servers = ["162.159.200.1", "162.159.200.123"]
+
+[[services.mounts]]
+what = "configfs"
+where = "/sys/kernel/config"
+type = "configfs"
+description = "Kernel Configuration File System"
+condition_path_exists = "/sys/kernel/config"
+
+[[services.units]]
+name = "llamacpp"
+description = "llama.cpp inference server"
+exec = "/usr/local/bin/llama-server --model ${LLAMACPP_MODEL} --host 127.0.0.1 --port 8080 --ctx-size 4096 --threads ${LLAMACPP_THREADS}"
+after = ["verity-config.service", "verity-models.service", "lock-modules.service"]
+requires = ["verity-config.service", "verity-models.service"]
+environment_file = "/mnt/config/config.env"
+hardening = "full"
+user = "llamacpp"
+unset_environment = ["LD_PRELOAD", "LD_LIBRARY_PATH"]
+extra_options = [
+  "MemoryDenyWriteExecute=yes",
+  "SystemCallFilter=@system-service @resources @ipc ioctl mmap mprotect",
+  "RestrictNamespaces=no",
+  "TimeoutStartSec=120",
+  "StartLimitBurst=3",
+  "StartLimitIntervalSec=120",
+]
+
+[[services.units]]
+name = "kawa"
+description = "Kawa Noise_XX TLS proxy"
+exec = "/usr/local/bin/kawa"
+after = ["llamacpp.service", "verity-config.service", "sys-kernel-config.mount", "network-online.target", "lock-modules.service"]
+requires = ["verity-config.service", "sys-kernel-config.mount"]
+wants = ["network-online.target", "llamacpp.service"]
+environment_file = "/mnt/config/config.env"
+unset_environment = ["LD_PRELOAD", "LD_LIBRARY_PATH"]
+hardening = "full"
+read_write_paths = ["/sys/kernel/config"]
+device_allow = ["/dev/sev-guest rw", "/dev/tdx-guest rw"]
+extra_options = [
+  "MemoryDenyWriteExecute=yes",
+  "InaccessiblePaths=/dev/shm",
+  "ProtectKernelTunables=no",
+  "StartLimitBurst=5",
+  "StartLimitIntervalSec=60",
+]
+
+[manifest]
+
+[manifest.snp]
+guest_features = 1
+ovmf_file = "OVMF.fd"
+
+[manifest.tdx]
+ovmf_file = "OVMF-TDX.fd"
+
+[assert]
+profile = "production"
+exclude = ["service_no_protect_kernel_tunables_off"]

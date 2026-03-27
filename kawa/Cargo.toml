@@ -1,0 +1,63 @@
+[package]
+name = "kawa"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Noise protocol
+snow = "0.9"
+
+# Post-quantum KEM (XWing Draft 06 — ML-KEM-768 + X25519)
+x-wing = { version = "0.1.0-pre.2", features = ["getrandom"] }
+kem = "0.3.0-rc.6"
+
+# Crypto primitives (post-XWing cipher state)
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# HTTP / WebSocket
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+hyper-tungstenite = "0.15"
+tokio-tungstenite = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async utilities
+futures-util = "0.3"
+
+# Misc
+rand = "0.9"
+libc = "0.2"
+
+# vsock (teehost connectivity)
+tokio-vsock = "0.6"
+
+[features]
+default = []
+mock = []  # Enable mock attestation (dev/testing only — never enable in production images)
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

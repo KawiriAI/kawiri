@@ -1,0 +1,38 @@
+{
+  "buildInputs": {
+    "rootfs_roothash": "5b3380861cad5a5f438baefb41f6216bf4027ce3fe9d82fd5250c142fd9dcee7",
+    "model_roothash": "54fc2f065781a12523f256dfe0a6cf732721608d76e751bce80747b090052bf3",
+    "model_hashoffset": 1671131136,
+    "config_roothash": "d3ed84e9622203a1ccf5649ae0a84537e08621bf223920f7155b02e4ecf76a04",
+    "config_hashoffset": 67108864,
+    "kernel_sha256": "ffe114679a7724c25056f409dc133682e44fcf4cceae366bb7cd3d74af23620e",
+    "initrd_sha256": "3ac4ca2f594cd665494984a8ebf54d9a534702d136ee497945938881583043c7",
+    "ovmf_sha256": "0e3e7879e4098efbccb41fea25d959e5cfff9a0526c4d61aaf2afb3560075de3",
+    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=5b3380861cad5a5f438baefb41f6216bf4027ce3fe9d82fd5250c142fd9dcee7 console=ttyS0,115200n8 models_roothash=54fc2f065781a12523f256dfe0a6cf732721608d76e751bce80747b090052bf3 models_hashoffset=1671131136 config_roothash=d3ed84e9622203a1ccf5649ae0a84537e08621bf223920f7155b02e4ecf76a04 config_hashoffset=67108864"
+  },
+  "measurements": {
+    "snp": {
+      "SNP_EPYC-Genoa": "193136a041fcbc5a7b98fd6092aa72cbfdee83910c747e045b684e3fdc3a88b16782f005e1d2d7a60d21407dcbc2bf6c",
+      "SNP_EPYC-Milan": "4e64c18b68eb4f0ba87594c8a57f90050cd91f4ecbc992330c64ba7d74c821f3d251b663273f60f3d93dea391699e4b1",
+      "SNP_EPYC-Rome": "ca50045c39f69100c7fd4acde0557934555e379bdb3109f5c8286995f7e17e627c4d21eb8252169ae88349bbd4da0db6",
+      "SNP_EPYC-v4": "0da35c04f304209bb17a44362b400d2d855b035f2539fa22d209da3b2d9460c0e99c24aa55820fb9e05557ae7d83c2b8"
+    },
+    "tdx": {
+      "MRTD": "5295fe8c30d9b8768f207d0148ce7853ef7b59b88710b287219245bae4f36903f20b0437d94e28d2de68e50bbcd1af8c",
+      "RTMR0": "ba249794529d3fb6a718610b67890ce66dc4ba164d0d4c0b55a004ec27e2170cfa0d182469cb82ab8371fbe8c936026d",
+      "RTMR1": "eb05c398e3840f261eea07d3a9df05e9619d58fd8a839a110089ea34583f01b483c49db327ddd84a44829581574b3f66",
+      "RTMR2": "157b23b1feb72062b6b5ec7a5e03859384794aea8e6d5f5f4ce270e0bb872849ea5604662a17caf41d045c8ea40c98a8",
+      "RTMR3": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "policy": {
+    "debugDisabled": true,
+    "migrationDisabled": true,
+    "verityEnabled": true,
+    "panicOnCorruption": true,
+    "shellsRemoved": true,
+    "outboundDeny": true,
+    "modulesLocked": true,
+    "kernelLockdown": "confidentiality"
+  }
+}

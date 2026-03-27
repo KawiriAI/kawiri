@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "paths": {
+      "@core/*": ["./core/*"],
+      "@katt/*": ["./katt/*"]
+    }
+  },
+  "include": ["core", "katt", "test"]
+}

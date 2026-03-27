@@ -1,0 +1,35 @@
+name: Release OVMF
+
+on:
+  push:
+    tags: ['ovmf-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build OVMF firmware
+        run: |
+          docker buildx build \
+            -f firmware/Dockerfile.ovmf \
+            -o firmware/out/ \
+            firmware/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          ARCHIVE="ovmf-${TAG#ovmf-}.tar.gz"
+          tar czf "$ARCHIVE" -C firmware/out .
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            "$ARCHIVE" \
+            "$ARCHIVE.sha256"
