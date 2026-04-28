@@ -4,3 +4,5 @@ target/
 dist/
 kcvm/base-image/kawa
 kcvm/bin/
+kcvm/images/*/build/
+kcvm/images/*/disks/

@@ -8,6 +8,8 @@ base = "Dockerfile"
 context = "../.."
 base_image = "cvm-base:latest"
 base_image_dockerfile = "base-image/Dockerfile"
+kawa_version = "0.1.0"
+ovmf_version = "0.1.0"
 
 [kernel]
 cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd"
@@ -130,7 +132,7 @@ guest_features = 1
 ovmf_file = "OVMF.fd"
 
 [manifest.tdx]
-ovmf_file = "OVMF-TDX.fd"
+ovmf_file = "OVMF_TDX.fd"
 
 # Security assertion profile — validates config against security policy
 [assert]
