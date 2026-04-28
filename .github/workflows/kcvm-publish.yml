@@ -12,7 +12,7 @@ name: Mirror kcvm to bucket
 #   AWS_ENDPOINT_URL       — full S3 endpoint URL (any S3-compatible backend)
 #   AWS_ACCESS_KEY_ID      — credential pair, scoped to the bucket, read+write
 #   AWS_SECRET_ACCESS_KEY  — paired secret
-#   BUCKET                 — bucket name
+#   KCVM_BUCKET            — bucket name
 
 on:
   push:
@@ -35,7 +35,7 @@ env:
   AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  BUCKET: ${{ secrets.BUCKET }}
+  KCVM_BUCKET: ${{ secrets.KCVM_BUCKET }}
 
 jobs:
   mirror:
@@ -46,7 +46,7 @@ jobs:
       - name: Verify required secrets are present
         run: |
           missing=0
-          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY BUCKET; do
+          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY KCVM_BUCKET; do
             if [ -z "${!v:-}" ]; then
               echo "::error::missing secret $v"
               missing=1
@@ -56,12 +56,12 @@ jobs:
 
       - name: Mirror base-image/
         run: |
-          aws s3 sync kcvm/base-image/ "s3://${BUCKET}/base-image/" \
+          aws s3 sync kcvm/base-image/ "s3://${KCVM_BUCKET}/base-image/" \
             --delete --no-progress
 
       - name: Mirror images/
         run: |
-          aws s3 sync kcvm/images/ "s3://${BUCKET}/images/" \
+          aws s3 sync kcvm/images/ "s3://${KCVM_BUCKET}/images/" \
             --delete --no-progress
 
       - name: Job summary
@@ -70,6 +70,6 @@ jobs:
           {
             echo "### kcvm mirror"
             echo ""
-            echo "- Bucket: \`${BUCKET}\`"
+            echo "- Bucket: \`${KCVM_BUCKET}\`"
             echo "- Commit: \`${GITHUB_SHA:0:12}\`"
           } >> "$GITHUB_STEP_SUMMARY"
