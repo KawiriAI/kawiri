@@ -1,18 +1,18 @@
-name: Mirror kcvm to R2
+name: Mirror kcvm to bucket
 
-# On push to main, mirror kcvm/{base-image,images}/ → s3://<bucket>/.
+# On push to main, mirror kcvm/{base-image,images}/ to an S3-compatible bucket.
 # Bucket layout 1:1 with the source dirs:
 #   base-image/Dockerfile
 #   images/<id>/{cvm.toml, Dockerfile, manifest.expected.json}
 #
-# build.sh and any other kcvm/ siblings are excluded — the bucket holds only
-# what teehost / cvmbuild consume on a deployed host.
+# build.sh and other kcvm/ siblings are excluded — the bucket holds only what
+# teehost / cvmbuild consume on a deployed host.
 #
 # Required secrets:
-#   R2_ENDPOINT_URL       — full S3 endpoint (e.g. https://<account>.r2.cloudflarestorage.com)
-#   R2_ACCESS_KEY_ID      — R2 API token, scoped to the bucket, read+write
-#   R2_SECRET_ACCESS_KEY  — paired secret
-#   R2_BUCKET             — bucket name (e.g. teehost-images)
+#   AWS_ENDPOINT_URL       — full S3 endpoint URL (any S3-compatible backend)
+#   AWS_ACCESS_KEY_ID      — credential pair, scoped to the bucket, read+write
+#   AWS_SECRET_ACCESS_KEY  — paired secret
+#   BUCKET                 — bucket name
 
 on:
   push:
@@ -32,10 +32,10 @@ concurrency:
 
 env:
   AWS_DEFAULT_REGION: auto
-  AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+  AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  BUCKET: ${{ secrets.BUCKET }}
 
 jobs:
   mirror:
@@ -46,9 +46,9 @@ jobs:
       - name: Verify required secrets are present
         run: |
           missing=0
-          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_BUCKET; do
+          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY BUCKET; do
             if [ -z "${!v:-}" ]; then
-              echo "::error::missing secret backing $v"
+              echo "::error::missing secret $v"
               missing=1
             fi
           done
@@ -56,21 +56,20 @@ jobs:
 
       - name: Mirror base-image/
         run: |
-          aws s3 sync kcvm/base-image/ "s3://${R2_BUCKET}/base-image/" \
+          aws s3 sync kcvm/base-image/ "s3://${BUCKET}/base-image/" \
             --delete --no-progress
 
       - name: Mirror images/
         run: |
-          aws s3 sync kcvm/images/ "s3://${R2_BUCKET}/images/" \
+          aws s3 sync kcvm/images/ "s3://${BUCKET}/images/" \
             --delete --no-progress
 
       - name: Job summary
         if: always()
         run: |
           {
-            echo "### kcvm mirror to R2"
+            echo "### kcvm mirror"
             echo ""
-            echo "- Bucket: \`${R2_BUCKET}\`"
-            echo "- Endpoint: \`${AWS_ENDPOINT_URL}\`"
+            echo "- Bucket: \`${BUCKET}\`"
             echo "- Commit: \`${GITHUB_SHA:0:12}\`"
           } >> "$GITHUB_STEP_SUMMARY"
