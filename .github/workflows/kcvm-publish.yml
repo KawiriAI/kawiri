@@ -9,7 +9,7 @@ name: Mirror kcvm to R2
 # what teehost / cvmbuild consume on a deployed host.
 #
 # Required secrets:
-#   R2_ACCOUNT_ID         — Cloudflare account ID
+#   R2_ENDPOINT_URL       — full S3 endpoint (e.g. https://<account>.r2.cloudflarestorage.com)
 #   R2_ACCESS_KEY_ID      — R2 API token, scoped to the bucket, read+write
 #   R2_SECRET_ACCESS_KEY  — paired secret
 #   R2_BUCKET             — bucket name (e.g. teehost-images)
@@ -32,7 +32,7 @@ concurrency:
 
 env:
   AWS_DEFAULT_REGION: auto
-  AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
   AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   R2_BUCKET: ${{ secrets.R2_BUCKET }}
@@ -44,13 +44,11 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Verify required secrets are present
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
           missing=0
-          for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_BUCKET; do
             if [ -z "${!v:-}" ]; then
-              echo "::error::missing secret $v"
+              echo "::error::missing secret backing $v"
               missing=1
             fi
           done
