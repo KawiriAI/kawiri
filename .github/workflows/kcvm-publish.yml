@@ -1,45 +1,44 @@
-name: Publish kcvm sources to R2
+name: Mirror kcvm to R2
 
-# Triggered post-merge on main when kcvm/, base-image/, or kawa version changes.
-# For each image, computes a content-addressed source_hash. If R2's HEAD pointer
-# doesn't match, packs the source bundle and uploads. Idempotent.
+# On push to main, mirror kcvm/{base-image,images}/ → s3://<bucket>/.
+# Bucket layout 1:1 with the source dirs:
+#   base-image/Dockerfile
+#   images/<id>/{cvm.toml, Dockerfile, manifest.expected.json}
+#
+# build.sh and any other kcvm/ siblings are excluded — the bucket holds only
+# what teehost / cvmbuild consume on a deployed host.
 #
 # Required secrets:
-#   R2_ACCOUNT_ID         — Cloudflare account ID (used to build endpoint URL)
+#   R2_ACCOUNT_ID         — Cloudflare account ID
 #   R2_ACCESS_KEY_ID      — R2 API token, scoped to the bucket, read+write
 #   R2_SECRET_ACCESS_KEY  — paired secret
 #   R2_BUCKET             — bucket name (e.g. teehost-images)
-#
-# Bucket layout produced:
-#   <image-id>/HEAD                                  — JSON {source_hash, git_commit, ts}
-#   <image-id>/sources/<source_hash>.tar.gz          — immutable source bundle
-#   <image-id>/sources/<source_hash>.expected.json   — committed manifest (if present)
 
 on:
   push:
     branches: [main]
     paths:
-      - 'kcvm/**'
-      - 'kawa/Cargo.toml'                # kawa version bump → all images
+      - 'kcvm/base-image/**'
+      - 'kcvm/images/**'
       - '.github/workflows/kcvm-publish.yml'
-  workflow_dispatch:                      # manual trigger from the Actions UI
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: kcvm-publish-main
-  cancel-in-progress: false               # don't cancel a publish mid-upload
+  cancel-in-progress: false
 
 env:
-  AWS_DEFAULT_REGION: auto                # R2 ignores region but the SDK requires one
+  AWS_DEFAULT_REGION: auto
   AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
   AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
 jobs:
-  publish:
+  mirror:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -57,97 +56,23 @@ jobs:
           done
           [ $missing -eq 0 ]
 
-      - name: Publish changed images
+      - name: Mirror base-image/
         run: |
-          set -euo pipefail
+          aws s3 sync kcvm/base-image/ "s3://${R2_BUCKET}/base-image/" \
+            --delete --no-progress
 
-          # ── Inputs that affect EVERY image ────────────────────────
-          # base-image (shared CPU + GPU Dockerfiles) and the kawa
-          # version (Cargo.toml is enough — Cargo.lock would also work).
-          base_hash=$(find kcvm/base-image -type f -print0 \
-                      | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
-          kawa_hash=$(sha256sum kawa/Cargo.toml | awk '{print $1}')
-          echo "base-image hash: ${base_hash:0:12}  kawa hash: ${kawa_hash:0:12}"
-
-          git_commit="${GITHUB_SHA}"
-          ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-          published=0
-          skipped=0
-
-          for img_dir in kcvm/images/*/; do
-            image_id=$(basename "${img_dir}")
-
-            # Per-image source hash: image dir + shared deps
-            img_hash=$(find "${img_dir}" -type f -print0 \
-                       | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
-            source_hash=$(printf '%s\n%s\n%s\n' "${base_hash}" "${kawa_hash}" "${img_hash}" \
-                          | sha256sum | awk '{print $1}')
-
-            # ── Compare with current HEAD on R2 ─────────────────────
-            head_key="s3://${R2_BUCKET}/${image_id}/HEAD"
-            current_hash=""
-            if aws s3 cp "${head_key}" /tmp/HEAD.cur.json 2>/dev/null; then
-              current_hash=$(jq -r '.source_hash // ""' </tmp/HEAD.cur.json)
-            fi
-
-            if [ "${current_hash}" = "${source_hash}" ]; then
-              echo "skip   ${image_id}  (up-to-date ${source_hash:0:12})"
-              skipped=$((skipped+1))
-              continue
-            fi
-
-            echo "publish ${image_id}  (${current_hash:0:12} → ${source_hash:0:12})"
-
-            # ── Pack source bundle ───────────────────────────────────
-            # Includes the image dir + base-image. kawa is NOT bundled —
-            # consumers pull a pinned kawa release tarball separately
-            # (its version is captured in source_hash via Cargo.toml).
-            bundle="/tmp/${image_id}.tar.gz"
-            tar czf "${bundle}" -C kcvm "images/${image_id}" "base-image"
-
-            # ── Upload immutable source bundle ──────────────────────
-            aws s3 cp "${bundle}" \
-              "s3://${R2_BUCKET}/${image_id}/sources/${source_hash}.tar.gz" \
-              --content-type application/gzip \
-              --no-progress
-
-            # ── Upload committed expected manifest (if present) ─────
-            manifest_src="${img_dir}manifest.expected.json"
-            if [ -f "${manifest_src}" ]; then
-              aws s3 cp "${manifest_src}" \
-                "s3://${R2_BUCKET}/${image_id}/sources/${source_hash}.expected.json" \
-                --content-type application/json \
-                --no-progress
-            fi
-
-            # ── Update HEAD pointer (mutable) ───────────────────────
-            jq -n \
-              --arg sh "${source_hash}" \
-              --arg gc "${git_commit}" \
-              --arg ts "${ts}" \
-              '{source_hash: $sh, git_commit: $gc, ts: $ts}' \
-              > /tmp/HEAD.new.json
-            aws s3 cp /tmp/HEAD.new.json "${head_key}" \
-              --content-type application/json \
-              --cache-control "no-cache, max-age=0" \
-              --no-progress
-
-            rm -f "${bundle}"
-            published=$((published+1))
-          done
-
-          echo "── summary ──"
-          echo "  published: ${published}"
-          echo "  skipped:   ${skipped}"
+      - name: Mirror images/
+        run: |
+          aws s3 sync kcvm/images/ "s3://${R2_BUCKET}/images/" \
+            --delete --no-progress
 
       - name: Job summary
         if: always()
         run: |
           {
-            echo "### kcvm publish to R2"
+            echo "### kcvm mirror to R2"
             echo ""
-            echo "Bucket: \`${R2_BUCKET}\`"
-            echo "Endpoint: \`${AWS_ENDPOINT_URL}\`"
-            echo "Commit: \`${GITHUB_SHA:0:12}\`"
+            echo "- Bucket: \`${R2_BUCKET}\`"
+            echo "- Endpoint: \`${AWS_ENDPOINT_URL}\`"
+            echo "- Commit: \`${GITHUB_SHA:0:12}\`"
           } >> "$GITHUB_STEP_SUMMARY"
