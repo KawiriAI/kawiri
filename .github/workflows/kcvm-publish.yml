@@ -60,9 +60,14 @@ jobs:
             --delete --no-progress
 
       - name: Mirror images/
+        # Exclude */build/* so the source-mirror's --delete doesn't wipe the
+        # `build/` artifacts that teehost uploads back into each image's
+        # prefix after a successful local build. CI only owns the source files
+        # (cvm.toml, Dockerfile, manifest.expected.json); teehost owns build/.
         run: |
           aws s3 sync kcvm/images/ "s3://${KCVM_BUCKET}/images/" \
-            --delete --no-progress
+            --delete --no-progress \
+            --exclude '*/build/*'
 
       - name: Job summary
         if: always()
