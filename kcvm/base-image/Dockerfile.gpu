@@ -12,6 +12,13 @@
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:67efaecc0031a612cf7bb3c863407018dbbef0a971f62032b77aa542ac8ac0d2
 ARG NVIDIA_DRIVER_VERSION=590.48.01
 ARG NVIDIA_MODULES_PKG=linux-modules-nvidia-590-open-6.17.0-14-generic
+# Mirror cvm-base's apt config so each cvmbuild session points sources.list at
+# its own (per-build, random-port) cache proxy. Without this rewrite, the
+# `final` stage inherits cvm-base's baked-in proxy URL from a previous session
+# whose proxy port is now dead, and `apt-get update` fails with
+# "connect (111: Connection refused)".
+ARG APT_MIRROR=http://snapshot.ubuntu.com
+ARG APT_SNAPSHOT=20260320T000000Z
 
 # ============================================================
 # Stage 1: Download NVIDIA userspace driver
@@ -38,6 +45,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ARG NVIDIA_DRIVER_VERSION
 ARG NVIDIA_MODULES_PKG
+ARG APT_MIRROR
+ARG APT_SNAPSHOT
+
+# Re-pin the apt mirror to this build's cache proxy. cvm-base baked in the
+# previous session's proxy URL; without re-pinning, apt-get update tries to
+# reach a long-dead port.
+RUN rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
+    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-updates main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-security main restricted universe multiverse"; \
+    } > /etc/apt/sources.list && \
+    { echo 'Acquire::Check-Valid-Until "false";'; \
+      echo 'Acquire::https::Verify-Peer "false";'; \
+    } > /etc/apt/apt.conf.d/99snapshot
 
 # Canonical-signed NVIDIA open-source kernel modules + GPU utilities
 RUN apt-get update && \
