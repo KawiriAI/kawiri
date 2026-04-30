@@ -1,6 +1,6 @@
 # kawiri-cvm — vLLM CPU inference image
 #
-# Requires: cvm-base:latest (build with: just build-base)
+# Requires: cvm-base:latest (built automatically by cvmbuild)
 #
 # Stage 1: Build vLLM AVX2 CPU wheel from source
 # Stage 2: Final CVM image — cvm-base + vLLM + Python deps

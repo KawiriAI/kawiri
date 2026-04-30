@@ -1,6 +1,6 @@
 # kawiri-cvm — llama.cpp Q4 GPU inference image (NVIDIA Confidential Computing)
 #
-# Requires: cvm-gpu-base:latest (build with: just build-gpu-base)
+# Requires: cvm-gpu-base:latest (built automatically by cvmbuild)
 #
 # Stage 1: Build llama.cpp with CUDA support
 # Stage 2: Final CVM image — cvm-gpu-base + CUDA libs + llama-server

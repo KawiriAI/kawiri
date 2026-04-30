@@ -1,6 +1,6 @@
 # kawiri-cvm — Qwen3-4B llama.cpp Q4 CPU inference image
 #
-# Requires: cvm-base:latest (build with: just build-base)
+# Requires: cvm-base:latest (built automatically by cvmbuild)
 #
 # Stage 1: Build llama.cpp from source (C++, no Python)
 # Stage 2: Final CVM image — cvm-base + llama-server

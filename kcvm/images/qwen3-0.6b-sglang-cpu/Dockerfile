@@ -1,6 +1,6 @@
 # kawiri-cvm — SGLang CPU inference image
 #
-# Requires: cvm-base:latest (build with: just build-base)
+# Requires: cvm-base:latest (built automatically by cvmbuild)
 #
 # Stage 1: Build SGLang CPU backend from source
 # Stage 2: Final CVM image — cvm-base + SGLang venv + runtime libs

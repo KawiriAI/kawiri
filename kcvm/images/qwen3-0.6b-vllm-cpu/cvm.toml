@@ -59,7 +59,7 @@ VLLM_MAX_MODEL_LEN = "2048"
 VLLM_MAX_NUM_SEQS = "4"
 ENABLE_PQ = "true"
 
-# Models — downloaded by `just download <image>`
+# Models — downloaded by cvmbuild during build
 [[models]]
 repo = "Qwen/Qwen3-0.6B"
 

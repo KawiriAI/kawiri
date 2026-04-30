@@ -1,6 +1,6 @@
 # kawiri-cvm — vLLM GPU inference image (NVIDIA Confidential Computing)
 #
-# Requires: cvm-gpu-base:latest (build with: just build-gpu-base)
+# Requires: cvm-gpu-base:latest (built automatically by cvmbuild)
 #
 # Build context must be xcvm repo root.
 #

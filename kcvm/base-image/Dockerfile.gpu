@@ -6,7 +6,7 @@
 #   - Module loading chain for SPDM/LKCA GPU attestation
 #   - nvidia-uvm loader service (retries for CC mode init)
 #
-# Build with: just build-gpu-base
+# Built automatically by cvmbuild as part of GPU image builds
 # Requires: cvm-base:latest
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:67efaecc0031a612cf7bb3c863407018dbbef0a971f62032b77aa542ac8ac0d2

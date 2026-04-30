@@ -49,7 +49,7 @@ SGLANG_MAX_MODEL_LEN = "2048"
 UPSTREAM_URL = "http://127.0.0.1:30000"
 ENABLE_PQ = "true"
 
-# Models — downloaded by `just download <image>`
+# Models — downloaded by cvmbuild during build
 [[models]]
 repo = "Qwen/Qwen3-0.6B"
 

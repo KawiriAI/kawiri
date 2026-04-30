@@ -51,7 +51,7 @@ ENABLE_PQ = "true"
 VLLM_TP_SIZE = "1"
 VLLM_GPU_MEM_UTIL = "0.90"
 
-# Models — downloaded by `just download <image>`
+# Models — downloaded by cvmbuild during build
 [[models]]
 repo = "Qwen/Qwen3-0.6B"
 
