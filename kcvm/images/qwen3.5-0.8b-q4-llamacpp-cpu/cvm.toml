@@ -8,7 +8,7 @@ base = "Dockerfile"
 context = "../.."
 base_image = "cvm-base:latest"
 base_image_dockerfile = "base-image/Dockerfile"
-kawa_version = "0.1.0"
+kawa_version = "0.1.1"
 ovmf_version = "0.1.0"
 
 [kernel]
