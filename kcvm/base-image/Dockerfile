@@ -2,17 +2,23 @@
 #
 # Shared CVM base (systemd + kernel + kawa + verity + firewall)
 #
-# kawa binary: auto-staged by cvmbuild from the version pinned in
-# `cvm.toml [image].kawa_version`. cvmbuild downloads the matching
-# kawa-v<ver>-linux-x86_64.tar.gz from KawiriAI/kawiri releases into
-# /var/lib/kawiri/kawa/<ver>/kawa and copies it into base-image/ before
-# invoking docker buildx, so the `COPY kawa /usr/local/bin/kawa` below
-# resolves automatically. No manual `cargo build` step is required.
+# Auto-staged by cvmbuild before docker build:
+#   kawa                     — binary at base-image/kawa, pinned by
+#                              cvm.toml [image].kawa_version. Downloaded
+#                              from KawiriAI/kawiri releases into
+#                              /var/lib/kawiri/kawa/<ver>/, copied here.
+#   dracut-modules/90verity-cvm/
+#                            — cvmbuild's dm-verity dracut module.
+#                              Shipped from cvmbuild's embedded assets,
+#                              copied into /usr/lib/dracut/modules.d/
+#                              by this Dockerfile.
 #
 # Reproducibility:
 #   - Base image pinned by sha256 digest
 #   - Apt mirror pinned to snapshot date
 #   - kawa version pinned per image (every byte feeds SNP/TDX measurements)
+#   - Initrd built by `dracut --reproducible` → deterministic by
+#     construction (replaces our previous post-build CPIO byte-rewriter)
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
 ARG APT_MIRROR=http://snapshot.ubuntu.com
@@ -59,8 +65,10 @@ RUN apt-get update && \
     # Networking / firewall
     nftables \
     systemd-timesyncd \
-    # Initramfs
-    initramfs-tools \
+    # Initramfs (dracut produces deterministic initrds via --reproducible;
+    # we no longer use initramfs-tools, which has open reproducibility
+    # bugs around CPIO inode numbers and mtimes)
+    dracut-core \
     # Common runtime libs
     procps \
     && apt-get clean \
@@ -70,20 +78,27 @@ RUN apt-get update && \
 COPY kawa /usr/local/bin/kawa
 RUN chmod 755 /usr/local/bin/kawa
 
-# --- verity-root initramfs hook ---
-COPY <<'HOOK' /etc/initramfs-tools/hooks/verity-root
-#!/bin/sh
-set -e
-. /usr/share/initramfs-tools/hook-functions
-copy_exec /usr/sbin/veritysetup
-manual_add_modules dm-mod dm-verity dm-bufio squashfs
-HOOK
-RUN chmod 755 /etc/initramfs-tools/hooks/verity-root \
-    && update-initramfs -c -k all \
-    && rm -f /boot/initrd.img.old
+# --- dracut module for dm-verity root activation ---
+# Staged by cvmbuild's stage_dracut_modules into base-image/dracut-modules/
+# alongside the kawa binary above. The module's verity-root.sh runs at
+# pre-mount inside the initrd, opens /dev/vda1 + /dev/vda2 via veritysetup,
+# and exposes /dev/mapper/root for the kernel `root=` flow.
+COPY dracut-modules/90verity-cvm/ /usr/lib/dracut/modules.d/90verity-cvm/
+RUN chmod 755 /usr/lib/dracut/modules.d/90verity-cvm/*.sh \
+    && KVER=$(ls /lib/modules) \
+    && dracut \
+        --reproducible \
+        --force \
+        --no-hostonly \
+        --no-hostonly-cmdline \
+        --strip \
+        --add 'verity-cvm' \
+        --omit 'lvm mdraid iscsi nfs cifs nbd plymouth network network-legacy network-manager dracut-network systemd-networkd resume bootchart fips selinux btrfs zfs dasd fcoe' \
+        /boot/initrd.img-${KVER} ${KVER}
 
 # --- Reproducibility: remove non-deterministic files ---
+# Most of these are now redundant — cvmbuild's purge_build_logs handles
+# them in the rootfs builder — but keeping them as defense in depth.
 RUN echo "" > /etc/machine-id \
-    && rm -f /boot/initrd.img.old \
     && rm -f /var/cache/ldconfig/aux-cache \
     && rm -f /var/log/apt/history.log /var/log/apt/term.log /var/log/dpkg.log
