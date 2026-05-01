@@ -2,13 +2,17 @@
 #
 # Shared CVM base (systemd + kernel + kawa + verity + firewall)
 #
-# Requires: pre-built kawa binary at kcvm/base-image/kawa
-#   Build with: cd kawa && cargo build --release && cp target/release/kawa ../kcvm/base-image/
-#   Or: ./kcvm/build.sh
+# kawa binary: auto-staged by cvmbuild from the version pinned in
+# `cvm.toml [image].kawa_version`. cvmbuild downloads the matching
+# kawa-v<ver>-linux-x86_64.tar.gz from KawiriAI/kawiri releases into
+# /var/lib/kawiri/kawa/<ver>/kawa and copies it into base-image/ before
+# invoking docker buildx, so the `COPY kawa /usr/local/bin/kawa` below
+# resolves automatically. No manual `cargo build` step is required.
 #
 # Reproducibility:
 #   - Base image pinned by sha256 digest
 #   - Apt mirror pinned to snapshot date
+#   - kawa version pinned per image (every byte feeds SNP/TDX measurements)
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
 ARG APT_MIRROR=http://snapshot.ubuntu.com
