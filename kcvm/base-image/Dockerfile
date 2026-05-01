@@ -10,9 +10,12 @@
 #   - Base image pinned by sha256 digest
 #   - Apt mirror pinned to snapshot date
 
-ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:67efaecc0031a612cf7bb3c863407018dbbef0a971f62032b77aa542ac8ac0d2
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
 ARG APT_MIRROR=http://snapshot.ubuntu.com
-ARG APT_SNAPSHOT=20260320T000000Z
+ARG APT_SNAPSHOT=20260426T000000Z
+# Kernel ABI pinned literally (no HWE meta) so cvm-base and cvm-gpu-base
+# stay in lockstep with linux-modules-nvidia-XXX-open-<ABI>-generic.
+ARG KERNEL_ABI=7.0.0-14-generic
 
 FROM ${UBUNTU_IMAGE} AS final
 
@@ -21,10 +24,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ARG APT_MIRROR
 ARG APT_SNAPSHOT
+ARG KERNEL_ABI
 RUN rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
-    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble main restricted universe multiverse"; \
-      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-updates main restricted universe multiverse"; \
-      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-security main restricted universe multiverse"; \
+    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-updates main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-security main restricted universe multiverse"; \
     } > /etc/apt/sources.list && \
     { echo 'Acquire::Check-Valid-Until "false";'; \
       echo 'Acquire::https::Verify-Peer "false";'; \
@@ -39,8 +43,9 @@ RUN apt-get update && \
     dbus \
     ca-certificates \
     ubuntu-keyring \
-    # Kernel
-    linux-generic-hwe-24.04 \
+    # Kernel (literal ABI pin — keep in sync with cvm-gpu-base nvidia-open modules)
+    linux-image-${KERNEL_ABI} \
+    linux-modules-${KERNEL_ABI} \
     # Python (needed by verity-activate.py in all images)
     python3-minimal \
     # Crypto / verity
