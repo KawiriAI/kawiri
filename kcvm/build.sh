@@ -6,7 +6,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CVMBUILD_VERSION="${CVMBUILD_VERSION:-v0.1.0}"
+CVMBUILD_VERSION="${CVMBUILD_VERSION:-v0.1.1}"
 CVMBUILD_BIN="kcvm/bin/cvmbuild"
 
 if [ ! -x "$CVMBUILD_BIN" ]; then
