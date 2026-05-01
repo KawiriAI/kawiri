@@ -7,11 +7,20 @@
 #                              cvm.toml [image].kawa_version. Downloaded
 #                              from KawiriAI/kawiri releases into
 #                              /var/lib/kawiri/kawa/<ver>/, copied here.
-#   dracut-modules/90verity-cvm/
-#                            — cvmbuild's dm-verity dracut module.
-#                              Shipped from cvmbuild's embedded assets,
-#                              copied into /usr/lib/dracut/modules.d/
-#                              by this Dockerfile.
+#
+# dm-verity root activation uses systemd's standard pipeline (no custom
+# dracut module): apt brings in `systemd-cryptsetup` (provides
+# /usr/lib/systemd/systemd-veritysetup + the cmdline generator) and
+# `dmsetup` (provides 10-dm.rules + 60-persistent-storage-dm.rules,
+# which release the libdevmapper udev cookie and emit SYSTEMD_READY=1
+# so dev-mapper-root.device transitions to active). dracut's stock
+# 11systemd-veritysetup + 70dm modules wire those together at initrd
+# build time. The kernel cmdline carries
+#   roothash=<hex>
+#   systemd.verity_root_data=/dev/vda1
+#   systemd.verity_root_hash=/dev/vda2
+#   systemd.verity_root_options=panic-on-corruption
+# and systemd-veritysetup-generator synthesizes systemd-veritysetup@root.service.
 #
 # Reproducibility:
 #   - Base image pinned by sha256 digest
@@ -58,8 +67,15 @@ RUN apt-get update && \
     linux-modules-${KERNEL_ABI} \
     # Python (needed by verity-activate.py in all images)
     python3-minimal \
-    # Crypto / verity
+    # Crypto / verity. systemd-cryptsetup provides systemd-veritysetup
+    # binary + system-generators/systemd-veritysetup-generator (without
+    # which dracut's 11systemd-veritysetup module silently disables
+    # itself). dmsetup ships the 10-dm.rules / 60-persistent-storage-dm
+    # rules that release the libdevmapper udev cookie and mark dm
+    # devices SYSTEMD_READY=1.
     cryptsetup-bin \
+    systemd-cryptsetup \
+    dmsetup \
     kmod \
     zstd \
     # Networking / firewall
@@ -78,21 +94,22 @@ RUN apt-get update && \
 COPY kawa /usr/local/bin/kawa
 RUN chmod 755 /usr/local/bin/kawa
 
-# --- dracut module for dm-verity root activation ---
-# Staged by cvmbuild's stage_dracut_modules into base-image/dracut-modules/
-# alongside the kawa binary above. The module's verity-root.sh runs at
-# pre-mount inside the initrd, opens /dev/vda1 + /dev/vda2 via veritysetup,
-# and exposes /dev/mapper/root for the kernel `root=` flow.
-COPY dracut-modules/90verity-cvm/ /usr/lib/dracut/modules.d/90verity-cvm/
-RUN chmod 755 /usr/lib/dracut/modules.d/90verity-cvm/*.sh \
-    && KVER=$(ls /lib/modules) \
+# --- Build the initrd with dracut's stock systemd-veritysetup pipeline ---
+# --add 'systemd-veritysetup' pulls in dracut's 11systemd-veritysetup
+# (which depends on 70dm, so dm rules + dmsetup come along automatically).
+# --add-drivers pins the kernel modules we always need: virtio block + net,
+# squashfs (root fs type), and the dm-verity stack. dracut's --reproducible
+# zeroes inode numbers and mtimes, so two cold builds of the same inputs
+# produce identical initrds (every byte feeds SNP/TDX measurements).
+RUN KVER=$(ls /lib/modules) \
     && dracut \
         --reproducible \
         --force \
         --no-hostonly \
         --no-hostonly-cmdline \
         --strip \
-        --add 'verity-cvm' \
+        --add 'systemd-veritysetup' \
+        --add-drivers 'virtio_blk virtio_pci virtio_net squashfs dm-verity dm-bufio dm-mod' \
         --omit 'lvm mdraid iscsi nfs cifs nbd plymouth network network-legacy network-manager dracut-network systemd-networkd resume bootchart fips selinux btrfs zfs dasd fcoe' \
         /boot/initrd.img-${KVER} ${KVER}
 
