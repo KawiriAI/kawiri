@@ -37,7 +37,6 @@
 #   policy-rc.d). Multi-GPU CVMs enable it via cvm.toml [services.units].
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
-ARG APT_MIRROR=http://snapshot.ubuntu.com
 ARG APT_SNAPSHOT=20260501T000000Z
 # Kernel ABI pinned literally — must match cvm-base's linux-modules-${KERNEL_ABI}
 ARG KERNEL_ABI=7.0.0-14-generic
@@ -57,7 +56,6 @@ FROM cvm-base:latest AS final
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
-ARG APT_MIRROR
 ARG APT_SNAPSHOT
 ARG KERNEL_ABI
 ARG NVIDIA_DRIVER_BRANCH
@@ -68,8 +66,11 @@ ARG NVIDIA_NSCQ_SHA256
 
 # Re-pin apt sources for this build's cache proxy. cvm-base bakes the previous
 # session's proxy URL; without re-pinning, apt-get update tries to reach a
-# long-dead port.
-RUN rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
+# long-dead port. The proxy URL comes in as a BuildKit secret (see cvm-base
+# Dockerfile for the full reasoning).
+RUN --mount=type=secret,id=apt_mirror,target=/run/secrets/apt_mirror \
+    APT_MIRROR=$(cat /run/secrets/apt_mirror) && \
+    rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
     { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute main restricted universe multiverse"; \
       echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-updates main restricted universe multiverse"; \
       echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-security main restricted universe multiverse"; \

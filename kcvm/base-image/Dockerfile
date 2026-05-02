@@ -30,7 +30,6 @@
 #     construction (replaces our previous post-build CPIO byte-rewriter)
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
-ARG APT_MIRROR=http://snapshot.ubuntu.com
 ARG APT_SNAPSHOT=20260501T000000Z
 # Kernel ABI pinned literally (no HWE meta) so cvm-base and cvm-gpu-base
 # stay in lockstep with linux-modules-nvidia-XXX-open-<ABI>-generic.
@@ -41,10 +40,18 @@ FROM ${UBUNTU_IMAGE} AS final
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
-ARG APT_MIRROR
 ARG APT_SNAPSHOT
 ARG KERNEL_ABI
-RUN rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
+# Apt mirror URL comes in as a BuildKit secret rather than a build arg.
+# cvmbuild's embedded apt cache proxy binds to a random port each run, so
+# using --build-arg APT_MIRROR=http://127.0.0.1:<random> would put the
+# random port string into this RUN command's hash and bust the layer cache
+# on every cvmbuild invocation. Secrets aren't part of the layer
+# fingerprint — only the mount declaration is — so the cache reuses
+# unchanged layers across runs even though the port differs.
+RUN --mount=type=secret,id=apt_mirror,target=/run/secrets/apt_mirror \
+    APT_MIRROR=$(cat /run/secrets/apt_mirror) && \
+    rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
     { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute main restricted universe multiverse"; \
       echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-updates main restricted universe multiverse"; \
       echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-security main restricted universe multiverse"; \
