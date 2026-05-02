@@ -1,27 +1,27 @@
 {
   "buildInputs": {
-    "rootfs_roothash": "10020fe980c1468e42dc7ae5a3f305eb685741d62db5fadc9672ffa422d9399b",
+    "rootfs_roothash": "4b69f868cc62b468566c80fc258a4f35458743b792892713ec265099cb6224a2",
     "model_roothash": "5fc3256540063b34e251e91fafd0a98a0e63c293453aa133cbb7d8bc4b397c38",
     "model_hashoffset": 1162465280,
-    "config_roothash": "cc65d69420143fcf6d5d0c7d595063dcd40f905285985a8fb76a2119f209c58d",
+    "config_roothash": "6d277b61a50ae5a7dfe3928e9791315520e5a87f5609d556dde7403d37045334",
     "config_hashoffset": 67108864,
-    "kernel_sha256": "ffe114679a7724c25056f409dc133682e44fcf4cceae366bb7cd3d74af23620e",
-    "initrd_sha256": "3ac4ca2f594cd665494984a8ebf54d9a534702d136ee497945938881583043c7",
+    "kernel_sha256": "6f11cd68fc0d181bb4f9a72e2d0ec6a1c2a69a59f7b9bd6bf9538630d1102456",
+    "initrd_sha256": "774ea0ab6cec16a20cfee51b530138620a772e78952671f4ee4b9129f9791352",
     "ovmf_sha256": "0e3e7879e4098efbccb41fea25d959e5cfff9a0526c4d61aaf2afb3560075de3",
-    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=10020fe980c1468e42dc7ae5a3f305eb685741d62db5fadc9672ffa422d9399b console=ttyS0,115200n8 models_roothash=5fc3256540063b34e251e91fafd0a98a0e63c293453aa133cbb7d8bc4b397c38 models_hashoffset=1162465280 config_roothash=cc65d69420143fcf6d5d0c7d595063dcd40f905285985a8fb76a2119f209c58d config_hashoffset=67108864"
+    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=4b69f868cc62b468566c80fc258a4f35458743b792892713ec265099cb6224a2 console=ttyS0,115200n8 models_roothash=5fc3256540063b34e251e91fafd0a98a0e63c293453aa133cbb7d8bc4b397c38 models_hashoffset=1162465280 config_roothash=6d277b61a50ae5a7dfe3928e9791315520e5a87f5609d556dde7403d37045334 config_hashoffset=67108864"
   },
   "measurements": {
     "snp": {
-      "SNP_EPYC-Genoa": "78456776272437d70615ce42d8787295c2afe72a4c887d8a06ddf62bba07351ce72f4c48f39ed877bcf11d9a26580234",
-      "SNP_EPYC-Milan": "57f5a8d76b9d371ff6cc7ddc3d103cf9246a8dbe1221f37b160d7d2589a7d6b98190e34c7a6590677255be5e7f095f7f",
-      "SNP_EPYC-Rome": "3c64b1d407b3f59854f12d92d45a8aaebb7b4a692429f182519c6fb9a1c27c37b89656dcc6c69fd313fc8970454add54",
-      "SNP_EPYC-v4": "03e295ac103aed8d6a5e2412396f623a9e022749c55eaed108fea7302d2dc0999d475d6e8af591a0b5275078a5d59f33"
+      "SNP_EPYC-Genoa": "116c9ebb08ace640a73f6407f1408231da38cfa5ad81092003c24b574faa876bf363f9edddf9117a7626a29c3eb9376a",
+      "SNP_EPYC-Milan": "7f1ea5eca422bd6be29dde721e65fc4dffca96de7f71209b95081dd936ddb3ebc296866dcc96ea9f651a2cba3050eeb3",
+      "SNP_EPYC-Rome": "1631f650cd82be219dd6e2f2ee4443b61cfdc1ea97942a781dd2e4b2f2a2eb53ce3eaa1538eaf0e8702aef3a1cf791fb",
+      "SNP_EPYC-v4": "25fb2e066ec61c4b9116707479f51ef46a8e1c4d819823593b05d9d78560f5271054b6829011ecc16fde833a87538d31"
     },
     "tdx": {
       "MRTD": "5295fe8c30d9b8768f207d0148ce7853ef7b59b88710b287219245bae4f36903f20b0437d94e28d2de68e50bbcd1af8c",
       "RTMR0": "ba249794529d3fb6a718610b67890ce66dc4ba164d0d4c0b55a004ec27e2170cfa0d182469cb82ab8371fbe8c936026d",
-      "RTMR1": "eb05c398e3840f261eea07d3a9df05e9619d58fd8a839a110089ea34583f01b483c49db327ddd84a44829581574b3f66",
-      "RTMR2": "843e1ead8b6cdefa340dd23b6cce4f07f25bc02f2b5f2aecf7e368e502d2a0d4cabc00c4cf8aa1d0bf1dc591c70e59a8",
+      "RTMR1": "541a512471f33287889fef747dddd6a466c6ede39c6cdae9051295ba4bd8d2f6761a385775abb470eed5c8349f88e070",
+      "RTMR2": "24adf78dfd058597a600414f2edb784cfd2d3c4555295fe8b8ec3975c794bc82fd049cba5ac3fe71983187da5e2557d9",
       "RTMR3": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     }
   },

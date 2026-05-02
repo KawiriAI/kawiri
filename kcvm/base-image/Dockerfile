@@ -31,7 +31,7 @@
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
 ARG APT_MIRROR=http://snapshot.ubuntu.com
-ARG APT_SNAPSHOT=20260426T000000Z
+ARG APT_SNAPSHOT=20260501T000000Z
 # Kernel ABI pinned literally (no HWE meta) so cvm-base and cvm-gpu-base
 # stay in lockstep with linux-modules-nvidia-XXX-open-<ABI>-generic.
 ARG KERNEL_ABI=7.0.0-14-generic
