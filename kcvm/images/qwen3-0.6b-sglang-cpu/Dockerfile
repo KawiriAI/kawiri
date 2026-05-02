@@ -11,7 +11,7 @@
 #   - Apt mirror pinned to snapshot date (inherited from cvm-base)
 #   - SGLang pinned by git tag
 
-ARG SGLANG_VERSION=v0.5.9
+ARG SGLANG_VERSION=v0.5.10.post1
 
 # ============================================================
 # Stage 1: Build SGLang CPU backend
@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-dev python3-pip python3-venv \
     curl ca-certificates \
     libnuma-dev libssl-dev libsqlite3-dev \
-    google-perftools libtbb-dev \
+    libgoogle-perftools-dev libtbb-dev \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
     && ln -sf /usr/bin/gcc /usr/bin/cc \
@@ -38,9 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir --break-system-packages uv==0.7.12
 
 WORKDIR /opt
-# Use system Python (3.12 on Ubuntu 24.04) so venv is compatible with final stage.
-# Replace symlinks with a real copy of the python binary so that when the venv
-# is copied to the final stage, Python's sys.executable resolves to
+# Use system Python so the venv is compatible with the final stage (the
+# venv copies binaries from this builder into /opt/.venv on the final
+# image — they must match the final image's Python ABI). Replace symlinks
+# with a real copy of the python binary so that when the venv is copied
+# to the final stage, Python's sys.executable resolves to
 # /opt/.venv/bin/python3 and pyvenv.cfg is found for site-packages discovery.
 RUN uv venv --python python3 && \
     REAL=$(readlink -f /opt/.venv/bin/python3) && \
@@ -59,7 +61,9 @@ RUN curl -fsSL https://github.com/sgl-project/sglang/archive/refs/tags/${SGLANG_
     | tar xz --strip-components=1
 ENV CC=gcc CXX=g++
 # setuptools-scm needs git metadata to infer version; tarballs don't have it
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.5.9
+# setuptools-scm reads the package version from git metadata; tarballs don't
+# have it. Strip the leading 'v' from SGLANG_VERSION (v0.5.10.post1 → 0.5.10.post1).
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SGLANG_VERSION#v}
 RUN source /opt/.venv/bin/activate && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
@@ -82,7 +86,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     python3 \
     libnuma1 \
-    google-perftools \
+    libgoogle-perftools4t64 \
     libtbbmalloc2 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*

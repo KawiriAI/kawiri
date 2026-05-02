@@ -2,101 +2,162 @@
 #
 # Extends cvm-base with NVIDIA Confidential Computing support:
 #   - Canonical-signed open-source kernel modules (nvidia.ko, nvidia-uvm.ko)
-#   - NVIDIA userspace driver (from .run installer, no kernel modules)
+#   - NVIDIA userspace driver from apt (libcuda, libnvidia-ml, nvidia-smi, GSP firmware)
+#   - nvidia-fabricmanager + libnvidia-nscq from NVIDIA's CUDA repo (multi-GPU NVLink/NVSwitch)
 #   - Module loading chain for SPDM/LKCA GPU attestation
 #   - nvidia-uvm loader service (retries for CC mode init)
 #
-# Built automatically by cvmbuild as part of GPU image builds
+# Built automatically by cvmbuild as part of GPU image builds.
 # Requires: cvm-base:latest
+#
+# Driver branch: NVIDIA "595" (595.58.03 in resolute). The "590" branch in
+# resolute is a transitional metapackage that depends on 595 — pinning 595
+# directly is the honest version.
+#
+# Trust roots:
+#   - Canonical apt (signed by Canonical's GPG key, in the base image's trust
+#     store): kernel modules, userspace driver libs, GSP firmware.
+#   - NVIDIA developer.download.nvidia.com (HTTP, SHA256-pinned per .deb in
+#     this Dockerfile): nvidia-fabricmanager + libnvidia-nscq, which Canonical
+#     does not package. We deliberately do NOT add NVIDIA's apt GPG key —
+#     just curl + sha256sum + dpkg -i for these two specific files.
+#
+# Why no .run blob:
+#   The previous Dockerfile invoked NVIDIA's `.run` installer with
+#   `--no-kernel-modules` to drop userspace bits. Every userspace component
+#   it provided is in Canonical's apt repo (libnvidia-compute-595,
+#   nvidia-utils-595, libnvidia-cfg1-595, nvidia-firmware-595-*). So the
+#   `.run` was paying NVIDIA-CDN trust + non-reproducibility cost to
+#   install bits Canonical already ships.
+#
+# Why fabricmanager + NSCQ are kept here even for single-GPU images:
+#   Installing the .deb is a few MB and benign; the daemon only does work
+#   when explicitly started by a service unit. Single-GPU images leave
+#   nvidia-fabricmanager.service disabled (default after dpkg-install via
+#   policy-rc.d). Multi-GPU CVMs enable it via cvm.toml [services.units].
 
-ARG UBUNTU_IMAGE=docker.io/library/ubuntu:24.04@sha256:67efaecc0031a612cf7bb3c863407018dbbef0a971f62032b77aa542ac8ac0d2
-ARG NVIDIA_DRIVER_VERSION=590.48.01
-ARG NVIDIA_MODULES_PKG=linux-modules-nvidia-590-open-6.17.0-14-generic
-# Mirror cvm-base's apt config so each cvmbuild session points sources.list at
-# its own (per-build, random-port) cache proxy. Without this rewrite, the
-# `final` stage inherits cvm-base's baked-in proxy URL from a previous session
-# whose proxy port is now dead, and `apt-get update` fails with
-# "connect (111: Connection refused)".
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
 ARG APT_MIRROR=http://snapshot.ubuntu.com
-ARG APT_SNAPSHOT=20260320T000000Z
-
-# ============================================================
-# Stage 1: Download NVIDIA userspace driver
-# ============================================================
-
-FROM ${UBUNTU_IMAGE} AS driver-download
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates && rm -rf /var/lib/apt/lists/*
-
-ARG NVIDIA_DRIVER_VERSION
-RUN curl -fsSL -o /tmp/NVIDIA-Linux-x86_64.run \
-    "https://us.download.nvidia.com/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run" && \
-    chmod +x /tmp/NVIDIA-Linux-x86_64.run
-
-# ============================================================
-# Stage 2: GPU base image (cvm-base + NVIDIA CC stack)
-# ============================================================
+ARG APT_SNAPSHOT=20260426T000000Z
+# Kernel ABI pinned literally — must match cvm-base's linux-modules-${KERNEL_ABI}
+ARG KERNEL_ABI=7.0.0-14-generic
+# NVIDIA driver: branch + exact version. The version pin must match between
+# Canonical's nvidia-* packages (kernel modules + userspace) and NVIDIA's
+# fabricmanager/NSCQ — RM, fabric, NSCQ all expect the same driver version.
+ARG NVIDIA_DRIVER_BRANCH=595
+ARG NVIDIA_DRIVER_VERSION=595.58.03-1ubuntu1
+ARG NVIDIA_CUDA_REPO=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64
+# SHA256 pins for the NVIDIA .debs we curl directly. Bump alongside
+# NVIDIA_DRIVER_VERSION when upgrading the driver.
+ARG NVIDIA_FABRICMANAGER_SHA256=a4199360a84cb4c7ede679b4c3cc3114aab51355db2d525822539782a2f6da6d
+ARG NVIDIA_NSCQ_SHA256=4698e437eaf6a012c15ccf9611a8fa358fb331af2c8f6506beff4d16f4f3cf9d
 
 FROM cvm-base:latest AS final
 
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
-ARG NVIDIA_DRIVER_VERSION
-ARG NVIDIA_MODULES_PKG
 ARG APT_MIRROR
 ARG APT_SNAPSHOT
+ARG KERNEL_ABI
+ARG NVIDIA_DRIVER_BRANCH
+ARG NVIDIA_DRIVER_VERSION
+ARG NVIDIA_CUDA_REPO
+ARG NVIDIA_FABRICMANAGER_SHA256
+ARG NVIDIA_NSCQ_SHA256
 
-# Re-pin the apt mirror to this build's cache proxy. cvm-base baked in the
-# previous session's proxy URL; without re-pinning, apt-get update tries to
-# reach a long-dead port.
+# Re-pin apt sources for this build's cache proxy. cvm-base bakes the previous
+# session's proxy URL; without re-pinning, apt-get update tries to reach a
+# long-dead port.
 RUN rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
-    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble main restricted universe multiverse"; \
-      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-updates main restricted universe multiverse"; \
-      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} noble-security main restricted universe multiverse"; \
+    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-updates main restricted universe multiverse"; \
+      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-security main restricted universe multiverse"; \
     } > /etc/apt/sources.list && \
     { echo 'Acquire::Check-Valid-Until "false";'; \
       echo 'Acquire::https::Verify-Peer "false";'; \
     } > /etc/apt/apt.conf.d/99snapshot
 
-# Canonical-signed NVIDIA open-source kernel modules + GPU utilities
+# Canonical-signed NVIDIA stack:
+#   linux-modules-nvidia-${BRANCH}-open-${KERNEL_ABI}
+#                           pre-built, signed kernel modules (open variant
+#                           required for SR-IOV passthrough and CC).
+#   nvidia-utils-${BRANCH}  nvidia-smi, nvidia-debugdump.
+#   libnvidia-compute-${BRANCH}
+#                           libcuda.so + libnvidia-ml.so — what kawa's GPU
+#                           attestation links against.
+#   libnvidia-cfg1-${BRANCH}
+#                           libnvidia-cfg.so (used by nvidia-smi).
+#   libnvidia-common-${BRANCH}
+#                           shared license/legal/config files.
+#   nvidia-compute-utils-${BRANCH}
+#                           nvidia-modprobe (used by load-nvidia-uvm.py).
+#   nvidia-firmware-${BRANCH}-*
+#                           GSP firmware blobs. The H100 firmware handshake
+#                           (SPDM secure channel) loads these at PCI probe.
+#                           Pulled transitively via libnvidia-compute →
+#                           nvidia-kernel-common-${BRANCH}.
+#   curl, ca-certificates   needed for the NVIDIA-repo .deb fetch below.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    kmod pciutils \
-    ${NVIDIA_MODULES_PKG} \
+    kmod pciutils curl ca-certificates \
+    linux-modules-nvidia-${NVIDIA_DRIVER_BRANCH}-open-${KERNEL_ABI} \
+    nvidia-utils-${NVIDIA_DRIVER_BRANCH} \
+    libnvidia-compute-${NVIDIA_DRIVER_BRANCH} \
+    libnvidia-cfg1-${NVIDIA_DRIVER_BRANCH} \
+    libnvidia-common-${NVIDIA_DRIVER_BRANCH} \
+    nvidia-compute-utils-${NVIDIA_DRIVER_BRANCH} \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
-# Verify NVIDIA modules are signed (fail the build if not)
-RUN KVER=$(ls /lib/modules/ | sort -V | tail -1) && \
-    for ko in $(find /lib/modules/${KVER} -name 'nvidia*.ko*' ! -name 'nvidia*fb*' ! -name 'nvidia-wmi*'); do \
+# Verify GSP firmware came along (libnvidia-compute pulls it transitively
+# via nvidia-kernel-common-${BRANCH}). Surface failure loudly if the chain
+# ever breaks rather than booting a CC GPU without firmware.
+RUN dpkg-query -W -f='${Package} ${Version}\n' "nvidia-firmware-${NVIDIA_DRIVER_BRANCH}-*" 2>/dev/null \
+        | tee /dev/stderr | grep -q "nvidia-firmware-${NVIDIA_DRIVER_BRANCH}-" \
+        || { echo "FATAL: nvidia-firmware-${NVIDIA_DRIVER_BRANCH}-* not installed"; exit 1; }
+
+# Verify NVIDIA modules are signed (defense in depth — Canonical's modules
+# SHOULD be signed; this catches any apt regression).
+RUN for ko in $(find /lib/modules/${KERNEL_ABI} -name 'nvidia*.ko*' ! -name 'nvidia*fb*' ! -name 'nvidia-wmi*'); do \
         if ! tail -c 28 "$ko" | grep -q 'Module signature appended'; then \
             echo "FATAL: unsigned module: $ko" >&2; exit 1; \
         fi; \
         echo "  signed: $(basename $ko)"; \
     done
 
-# --- Install NVIDIA userspace driver (no kernel modules) ---
-COPY --from=driver-download /tmp/NVIDIA-Linux-x86_64.run /tmp/
-RUN /tmp/NVIDIA-Linux-x86_64.run \
-    --silent \
-    --no-kernel-modules \
-    --no-drm \
-    --no-opengl-files \
-    --no-wine-files \
-    --no-distro-scripts \
-    --no-nouveau-check \
-    --no-rebuild-initramfs \
-    --no-backup \
-    && rm -f /tmp/NVIDIA-Linux-x86_64.run
+# nvidia-fabricmanager + libnvidia-nscq from NVIDIA's CUDA repo.
+# Canonical does not package these; they're required for multi-GPU NVLink/
+# NVSwitch fabric setup. Single-GPU images install but don't enable the
+# daemon — multi-GPU images enable nvidia-fabricmanager.service via cvm.toml.
+#
+# We do NOT add NVIDIA's apt GPG key. Instead we curl the two specific .debs,
+# verify their SHA256, and dpkg-install. Pinning by SHA gives byte-deterministic
+# reproducibility regardless of NVIDIA's repo ever rebuilding/republishing
+# packages, and avoids broadening the build-time apt trust set.
+#
+# Disable systemd unit auto-start during dpkg-install so single-GPU images
+# don't have a fabricmanager daemon attempting to talk to non-existent
+# NVSwitches at boot. Multi-GPU images opt back in via cvm.toml.
+RUN { echo '#!/bin/sh'; echo 'exit 101'; } > /usr/sbin/policy-rc.d \
+    && chmod 755 /usr/sbin/policy-rc.d \
+    && cd /tmp \
+    && curl -fsSL -o fabricmanager.deb \
+         "${NVIDIA_CUDA_REPO}/nvidia-fabricmanager_${NVIDIA_DRIVER_VERSION}_amd64.deb" \
+    && echo "${NVIDIA_FABRICMANAGER_SHA256}  fabricmanager.deb" | sha256sum -c - \
+    && curl -fsSL -o nscq.deb \
+         "${NVIDIA_CUDA_REPO}/libnvidia-nscq_${NVIDIA_DRIVER_VERSION}_amd64.deb" \
+    && echo "${NVIDIA_NSCQ_SHA256}  nscq.deb" | sha256sum -c - \
+    && dpkg -i fabricmanager.deb nscq.deb \
+    && rm -f fabricmanager.deb nscq.deb /usr/sbin/policy-rc.d \
+    && systemctl disable nvidia-fabricmanager.service 2>/dev/null || true
 
 # --- NVIDIA module loading and dependency chain ---
 # ecdsa_generic + ecdh must be available before nvidia.ko loads, otherwise
 # the SPDM secure channel to the GPU TEE cannot be established.
 # nvidia-uvm must load AFTER nvidia.ko's module_init() (PCI probe) completes,
 # because nvidia-uvm registers with nvidia's RM which isn't ready until probe
-# finishes. Using softdep post: ensures modprobe waits for nvidia to fully
+# finishes. softdep post: ensures modprobe waits for nvidia to fully
 # initialize before loading nvidia-uvm, avoiding the race where udev-triggered
 # nvidia loading and systemd-modules-load run concurrently.
 RUN printf 'ecdsa_generic\necdh\n' > /etc/modules-load.d/lkca-gpu-cc.conf && \

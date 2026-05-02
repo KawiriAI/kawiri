@@ -11,7 +11,7 @@
 #   - Apt mirror pinned to snapshot date (inherited from cvm-base)
 #   - vLLM built from pinned git tag
 
-ARG VLLM_VERSION=0.18.0
+ARG VLLM_VERSION=0.20.0
 
 # ============================================================
 # Stage 1: Build vLLM AVX2 CPU wheel

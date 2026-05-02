@@ -7,7 +7,7 @@
 # vLLM 0.17.0+ bundles CUDA libraries via pip nvidia-* wheels,
 # so we only need the NVIDIA userspace driver — no CUDA apt repo needed.
 
-ARG VLLM_VERSION=0.18.0
+ARG VLLM_VERSION=0.20.0
 
 # ============================================================
 # Final CVM image
