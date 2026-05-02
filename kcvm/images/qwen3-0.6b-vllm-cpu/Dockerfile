@@ -35,21 +35,25 @@ RUN pip install --no-cache-dir --break-system-packages uv==0.7.12
 # Python build deps — all pinned
 ENV UV_LINK_MODE=copy
 RUN uv pip install --system --break-system-packages --no-cache \
-    torch==2.9.1+cpu --index-url https://download.pytorch.org/whl/cpu && \
+    torch==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
     uv pip install --system --break-system-packages --no-cache \
-    setuptools==82.0.0 \
-    setuptools-scm==9.2.2 \
-    wheel==0.46.1 \
-    packaging==25.0 \
+    setuptools==77.0.3 \
+    setuptools-scm==10.0.5 \
+    wheel==0.47.0 \
+    packaging==26.2 \
     ninja==1.13.0 \
-    cmake==4.2.3 \
-    numpy==2.4.2 \
+    cmake==4.3.2 \
+    jinja2==3.1.6 \
+    regex==2026.4.4 \
+    numpy==2.4.4 \
     sentencepiece==0.2.1 \
-    transformers==5.2.0 \
-    pydantic==2.12.5 \
-    pillow==12.1.1 \
+    transformers==5.7.0 \
+    pydantic==2.13.3 \
+    pillow==12.2.0 \
     psutil==7.2.2 \
-    py-cpuinfo==9.0.0
+    py-cpuinfo==9.0.0 \
+    numba==0.65.0 \
+    intel-openmp==2024.2.1
 
 ARG VLLM_VERSION
 WORKDIR /vllm
@@ -95,25 +99,72 @@ RUN apt-get update && \
 # --- Install vLLM ---
 COPY --from=builder-vllm /dist/vllm-*.whl /tmp/
 RUN pip3 install --no-cache-dir --break-system-packages \
-    torch==2.9.1+cpu --index-url https://download.pytorch.org/whl/cpu && \
+    torch==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
     pip3 install --no-cache-dir --break-system-packages --no-deps /tmp/vllm-*.whl && \
     pip3 install --no-cache-dir --break-system-packages \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    numpy sentencepiece transformers pydantic pillow psutil py-cpuinfo \
-    tiktoken msgspec gguf compressed-tensors mistral-common \
-    prometheus-client prometheus-fastapi-instrumentator \
-    uvloop httptools fastapi uvicorn aiohttp \
-    openai lm-format-enforcer partial-json-parser \
-    depyf cloudpickle watchfiles python-json-logger ninja \
-    pybase64 cbor2 ijson setproctitle numba \
-    typing-extensions pyyaml tqdm protobuf requests filelock regex \
-    tokenizers safetensors huggingface-hub jinja2 \
-    model-hosting-container-standards pyzmq cachetools blake3 \
-    diskcache einops lark opencv-python-headless six \
-    outlines-core xgrammar grpcio mcp openai-harmony \
-    llguidance anthropic && \
-    rm -f /tmp/vllm-*.whl && \
-    rm -rf /root/.cache/pip
+    aiohttp==3.13.5 \
+    anthropic==0.97.0 \
+    blake3==1.0.8 \
+    cachetools==7.1.0 \
+    cbor2==6.0.1 \
+    cloudpickle==3.1.2 \
+    compressed-tensors==0.15.0.1 \
+    depyf==0.20.0 \
+    diskcache==5.6.3 \
+    einops==0.8.2 \
+    fastapi==0.136.1 \
+    filelock==3.29.0 \
+    gguf==0.18.0 \
+    grpcio==1.80.0 \
+    httptools==0.7.1 \
+    huggingface-hub==1.13.0 \
+    ijson==3.5.0 \
+    intel-openmp==2024.2.1 \
+    jinja2==3.1.6 \
+    lark==1.2.2 \
+    llguidance==1.3.0 \
+    lm-format-enforcer==0.11.3 \
+    mcp==1.27.0 \
+    "mistral-common[image]==1.11.1" \
+    model-hosting-container-standards==0.1.14 \
+    msgspec==0.21.1 \
+    ninja==1.13.0 \
+    numba==0.65.0 \
+    numpy==2.4.4 \
+    openai==2.33.0 \
+    openai-harmony==0.0.8 \
+    opencv-python-headless==4.13.0.92 \
+    outlines-core==0.2.14 \
+    partial-json-parser==0.2.1.1.post7 \
+    pillow==12.2.0 \
+    prometheus-client==0.25.0 \
+    prometheus-fastapi-instrumentator==7.1.0 \
+    protobuf==7.34.1 \
+    psutil==7.2.2 \
+    py-cpuinfo==9.0.0 \
+    pybase64==1.4.3 \
+    pydantic==2.13.3 \
+    python-json-logger==4.1.0 \
+    pyyaml==6.0.3 \
+    pyzmq==27.1.0 \
+    regex==2026.4.4 \
+    requests==2.33.1 \
+    safetensors==0.7.0 \
+    sentencepiece==0.2.1 \
+    setproctitle==1.3.7 \
+    six==1.17.0 \
+    tiktoken==0.12.0 \
+    tokenizers==0.22.2 \
+    tqdm==4.67.3 \
+    transformers==5.7.0 \
+    typing-extensions==4.15.0 \
+    uvicorn==0.46.0 \
+    uvloop==0.22.1 \
+    watchfiles==1.1.1 \
+    xgrammar==0.2.0 \
+    && rm -f /tmp/vllm-*.whl \
+    && rm -rf /root/.cache/pip
 
 # --- vllm-launcher (shell-free, env -i for CVM isolation) ---
 COPY <<'LAUNCHER' /usr/local/bin/vllm-launcher
