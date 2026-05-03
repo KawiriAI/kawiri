@@ -1,0 +1,21 @@
+#!/bin/sh
+# Regenerate the sshd ed25519 host key into /run/sshd-keys (tmpfs) at
+# every boot. konnect-proxy users pass StrictHostKeyChecking=no since
+# the outer attestation handshake already authenticated the CVM
+# identity — fresh per-boot host keys are fine and avoid the "embed a
+# private key in a public image" anti-pattern.
+set -eu
+
+KEY_DIR=/run/sshd-keys
+KEY=$KEY_DIR/ssh_host_ed25519_key
+
+mkdir -p "$KEY_DIR"
+chmod 700 "$KEY_DIR"
+
+if [ ! -f "$KEY" ]; then
+    ssh-keygen -t ed25519 -f "$KEY" -N "" -q
+    chmod 600 "$KEY"
+fi
+
+echo "sshd ed25519 host key:"
+ssh-keygen -l -f "$KEY"
