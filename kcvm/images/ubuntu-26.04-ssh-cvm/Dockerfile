@@ -1,11 +1,12 @@
-# ubuntu-26.04-ssh-cvm — attestation-gated SSH-able CVM
+# ubuntu-26.04-ssh-cvm — confidential VM with direct SSH
 #
-# This is NOT an inference image. There's no kawa upstream — kawa runs in
-# standalone+tunnel mode, accepting only `tunnel.open port=22` and relaying
-# bytes to a loopback sshd. Operators who SSH in get a normal Ubuntu shell
-# inside a confidential VM with read-only verity rootfs.
+# This is NOT an inference image and doesn't run kawa. sshd binds 0.0.0.0:8443
+# (matching teehost's hostfwd convention so no teehost change is needed) and
+# operators connect with stock SSH. Attestation is verified post-login by the
+# operator reading /sys/kernel/config/tsm/report directly inside the CVM.
 #
-# Requires cvm-base:latest (kawa, kernel, dracut, systemd, dm-verity stack).
+# Requires cvm-base:latest (kernel, dracut, systemd, dm-verity stack — the
+# kawa binary it ships is unused here, dead weight that costs ~5 MB).
 
 FROM cvm-base:latest
 

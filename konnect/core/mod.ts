@@ -62,9 +62,6 @@ export {
 export type { DecodedFrame } from "./transport/framer.ts";
 // Framer
 export { decode, encode, FrameAssembler } from "./transport/framer.ts";
-// Tunnel (post-handshake byte relay)
-export type { Tunnel } from "./transport/tunnel.ts";
-export { TunnelOpenError } from "./transport/tunnel.ts";
 // Transport types
 export type {
   AttestationPayload,

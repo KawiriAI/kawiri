@@ -3,7 +3,6 @@ import * as X25519 from "./noise/crypto.ts";
 import { HandshakeState, type TransportState } from "./noise/mod.ts";
 import * as Framer from "./transport/framer.ts";
 import { FrameAssembler } from "./transport/framer.ts";
-import { type Tunnel, TunnelOpenError } from "./transport/tunnel.ts";
 import type {
   AttestationPayload,
   ChatMessage,
@@ -55,19 +54,6 @@ export class KawiriClient {
    * `console.warn` so an operator skimming devtools can't miss it.
    */
   private isMockConnection = false;
-  /**
-   * Set to a Tunnel after a successful openTunnel(). When non-null, the
-   * client is in tunnel mode: incoming WS frames are routed as raw bytes
-   * to the tunnel's onData; chat()/request() throw. Mutually exclusive
-   * with the per-id RPC pending map.
-   */
-  private tunnel: ClientTunnel | null = null;
-  /**
-   * One-shot resolver for the tunnel.open reply (tunnel.opened or
-   * tunnel.error). Set during openTunnel() before the control message
-   * goes on the wire so we can't race the server's reply.
-   */
-  private tunnelOpenWaiter: ((reply: { kind: string; msg?: string }) => void) | null = null;
 
   constructor(opts: KawiriClientOptions) {
     this.options = {
@@ -276,19 +262,6 @@ export class KawiriClient {
         }
         this.pending.clear();
 
-        // If a tunnel.open was in flight, surface the close as a failure
-        // so the caller's awaiting promise doesn't hang.
-        if (this.tunnelOpenWaiter) {
-          const w = this.tunnelOpenWaiter;
-          this.tunnelOpenWaiter = null;
-          w({ kind: "tunnel.error", msg: "ws closed before tunnel.open reply" });
-        }
-        // If we're in tunnel mode, fire onClose so the consumer (e.g.
-        // konnect-proxy's local TCP socket) can tear down its side.
-        if (this.tunnel) {
-          this.tunnel._fireCloseFromWs();
-        }
-
         if (settled) {
           // Post-connect disconnect
           this.options.onDisconnect(event.reason || "Connection closed");
@@ -301,6 +274,9 @@ export class KawiriClient {
 
   private async handleTransportMessage(data: Uint8Array): Promise<void> {
     if (!this.transport) throw new Error("transport not established");
+    if (this.isMockConnection) {
+      console.warn("[kawiri] ⚠ recv on MOCK connection (no TEE backing this transport)");
+    }
     const plainFrame = await this.transport.decrypt(data);
     const decoded = Framer.decode(plainFrame);
 
@@ -312,37 +288,6 @@ export class KawiriClient {
     }
 
     if (!payload) return;
-
-    // Tunnel-mode: payload is opaque bytes from the remote loopback
-    // socket. Empty payload = upstream EOF (server-side socket closed).
-    if (this.tunnel) {
-      if (payload.length === 0) {
-        this.tunnel._closeFromTransport();
-      } else {
-        this.tunnel._deliver(payload);
-      }
-      return;
-    }
-
-    // Tunnel-open reply: one-shot waiter intercepts the next JSON frame
-    // before we transition the client into tunnel mode.
-    if (this.tunnelOpenWaiter) {
-      const waiter = this.tunnelOpenWaiter;
-      this.tunnelOpenWaiter = null;
-      try {
-        const reply = JSON.parse(new TextDecoder().decode(payload)) as { kind?: string; msg?: string };
-        waiter({ kind: reply.kind ?? "", msg: reply.msg });
-      } catch {
-        waiter({ kind: "tunnel.error", msg: "malformed tunnel.open reply" });
-      }
-      return;
-    }
-
-    // RPC mode below — emit the per-message mock warn now that we know
-    // this isn't a tunnel byte chunk (which would drown the log).
-    if (this.isMockConnection) {
-      console.warn("[kawiri] ⚠ recv on MOCK connection (no TEE backing this transport)");
-    }
 
     let json: Record<string, unknown>;
     try {
@@ -479,157 +424,11 @@ export class KawiriClient {
     return stream;
   }
 
-  /**
-   * Open an opaque byte tunnel to a loopback port inside the CVM. Sends
-   * the {kind:"tunnel.open", port} control message, awaits the server's
-   * tunnel.opened/tunnel.error reply, and consumes this client into
-   * tunnel mode. After this resolves, chat()/request() throw — the WS
-   * carries raw bytes from this point on.
-   *
-   * Throws TunnelOpenError on `tunnel.error` (port not in allowlist,
-   * connect refused, etc.) so callers can surface the server-supplied
-   * reason in their UI / logs.
-   */
-  async openTunnel(port: number): Promise<Tunnel> {
-    if (!this._connected || !this.transport || !this.ws) {
-      throw new Error("Not connected");
-    }
-    if (this.tunnel) {
-      throw new Error("Already in tunnel mode");
-    }
-    if (this.tunnelOpenWaiter) {
-      throw new Error("tunnel.open already in flight");
-    }
-
-    // Stage the reply waiter BEFORE the wire send so the server's
-    // response can't beat us into a "no waiter registered" race.
-    const replyPromise = new Promise<{ kind: string; msg?: string }>((resolve) => {
-      this.tunnelOpenWaiter = resolve;
-    });
-
-    if (this.isMockConnection) {
-      console.warn(
-        `[kawiri] ⚠ opening tunnel to port ${port} over MOCK transport — ` +
-          "bytes are encrypted but the server identity is NOT TEE-attested",
-      );
-    }
-
-    const ctrl = JSON.stringify({ kind: "tunnel.open", port });
-    const data = new TextEncoder().encode(ctrl);
-    const frames = Framer.encode(data);
-    for (const frame of frames) {
-      const enc = await this.transport.encrypt(frame);
-      this.ws.send(enc as Uint8Array<ArrayBuffer>);
-    }
-
-    const reply = await replyPromise;
-    if (reply.kind === "tunnel.error") {
-      throw new TunnelOpenError(reply.msg ?? "unknown");
-    }
-    if (reply.kind !== "tunnel.opened") {
-      throw new Error(`unexpected tunnel reply kind: ${reply.kind}`);
-    }
-
-    this.tunnel = new ClientTunnel(this);
-    return this.tunnel;
-  }
-
-  /**
-   * Internal: send a single raw-bytes frame in tunnel mode. Splitting
-   * across multiple Noise frames is rejected — kawa enforces single-
-   * frame tunnel envelopes, and konnect-proxy already chunks reads to
-   * stay under MAX_NOISE_PAYLOAD.
-   */
-  async _sendTunnelBytes(bytes: Uint8Array): Promise<void> {
-    if (!this._connected || !this.transport || !this.ws) {
-      throw new Error("Not connected");
-    }
-    const frames = Framer.encode(bytes);
-    if (frames.length !== 1) {
-      throw new Error(
-        `tunnel send too large: ${bytes.length} bytes (must fit in one Noise frame, ~64KB)`,
-      );
-    }
-    const enc = await this.transport.encrypt(frames[0]);
-    this.ws.send(enc as Uint8Array<ArrayBuffer>);
-  }
-
-  /** Internal: closes WS so the relay tears down on both ends. */
-  _closeWs(): void {
-    if (this.ws) {
-      this.ws.close(1000, "Tunnel closed");
-      this.ws = null;
-    }
-    this._connected = false;
-  }
-
   close(): void {
-    if (this.tunnel) {
-      this.tunnel.close();
-      return;
-    }
     if (this.ws) {
       this.ws.close(1000, "Client closed");
       this.ws = null;
     }
     this._connected = false;
-  }
-}
-
-/**
- * Default Tunnel implementation. Bridges KawiriClient's transport to
- * the user-facing onData/onClose callbacks. We expose `_deliver` and
- * `_closeFromTransport` as friend methods on the client side via the
- * leading underscore — TypeScript can't restrict access by file but
- * the convention keeps consumers honest.
- */
-class ClientTunnel implements Tunnel {
-  private client: KawiriClient;
-  private _closed = false;
-  onData: ((bytes: Uint8Array) => void) | null = null;
-  onClose: (() => void) | null = null;
-
-  constructor(client: KawiriClient) {
-    this.client = client;
-  }
-
-  get closed(): boolean {
-    return this._closed;
-  }
-
-  async send(bytes: Uint8Array): Promise<void> {
-    if (this._closed) throw new Error("tunnel closed");
-    await this.client._sendTunnelBytes(bytes);
-  }
-
-  /** Called by KawiriClient.handleTransportMessage when bytes arrive. */
-  _deliver(bytes: Uint8Array): void {
-    if (this._closed) return;
-    this.onData?.(bytes);
-  }
-
-  /** Called when the server signals upstream EOF (empty payload frame). */
-  _closeFromTransport(): void {
-    this._fireClose();
-    this.client._closeWs();
-  }
-
-  /** Called by KawiriClient when ws.onclose fires (network drop, server
-   *  kill, etc.). Distinguished from _closeFromTransport because we
-   *  must NOT recursively close the WS — it's already gone. */
-  _fireCloseFromWs(): void {
-    this._fireClose();
-  }
-
-  close(): void {
-    if (this._closed) return;
-    this._fireClose();
-    this.client._closeWs();
-  }
-
-  private _fireClose(): void {
-    if (this._closed) return;
-    this._closed = true;
-    this.onClose?.();
   }
 }

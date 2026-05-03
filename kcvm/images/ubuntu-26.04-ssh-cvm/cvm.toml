@@ -1,28 +1,34 @@
-# ubuntu-26.04-ssh-cvm — attestation-gated SSH-able CVM
+# ubuntu-26.04-ssh-cvm — confidential VM with direct SSH
 #
-# Operators tunnel into this image through konnect-proxy:
+# A CVM that exposes sshd directly on the port teehost forwards (kawa's
+# default 8443, so no teehost change is needed). Operators connect
+# straight with stock SSH — no kawa, no konnect-proxy, no tunnel mode.
 #
-#   konnect-proxy --to wss://my-host:13212 --tunnel 2222:22 \
-#     --manifest ./build/manifest.json
+# Workflow:
+#   curl -X POST http://localhost:8800/api/v1/vms \
+#        -d '{"image_dir":"…/ubuntu-26.04-ssh-cvm","tee":"snp",…}'
+#   → {"id":"vm-…","host_port":18443,…}
 #   ssh -i kawiri-test -o StrictHostKeyChecking=no \
-#     -o UserKnownHostsFile=/dev/null -p 2222 root@127.0.0.1
+#       -o UserKnownHostsFile=/dev/null \
+#       -p 18443 root@<vm-host>
 #
-# kawa runs in standalone+tunnel mode (no inference upstream). The only
-# inbound port on the CVM is 8443/tcp (kawa); SSH binds 127.0.0.1 inside
-# the CVM and is reachable solely through kawa's tunnel mode after the
-# attestation handshake.
+# Attestation is verified post-login by reading /sys/kernel/config/tsm/report
+# directly inside the CVM (see README) — there is no client-side attestation
+# gate before bytes flow. That trade is appropriate for the hosting use case
+# where the operator owns the image identity out-of-band and just wants to
+# confirm "the host booted what I built".
 #
 # Security boundary:
-#   - Host operator can't see VM memory / disk (TEE).
-#   - Anyone with kawiri-test's *private* key + reachable kawa endpoint
-#     gets root in the VM. The TEST keypair's pubkey is baked into the
-#     rootfs (overlay/root/.ssh/authorized_keys); a different pubkey
-#     produces a different SNP measurement, which is the right property.
-#     Production users fork this image and bake their own pubkey.
+#   - TEE (SNP/TDX) protects VM memory + disk against the host operator.
+#   - Anyone with kawiri-test's *private* key + a reachable host:port gets
+#     root in the VM. The TEST keypair's pubkey is baked into the rootfs
+#     (overlay/root/.ssh/authorized_keys); a different pubkey produces a
+#     different SNP measurement, which is the right property — production
+#     users fork this image and bake their own pubkey.
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.1.0"
+version = "0.2.0"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
@@ -36,27 +42,19 @@ enabled = true
 panic_on_corruption = true
 
 # Shells (bash/sh/dash) are intentionally KEPT — this image's whole purpose
-# is to give the SSH user an interactive shell inside an attested CVM.
-# We still strip apt/dpkg/pip/dmsetup since the rootfs is read-only verity
-# (you can't apt-install anyway) and pip is a common offensive-tooling
-# starting point. Belt-and-suspenders.
+# is to give the SSH user an interactive shell inside an attested CVM. We
+# still strip apt/dpkg/pip/dmsetup since the rootfs is read-only verity
+# anyway and pip is a common attacker-tooling starting point.
 [security]
 remove = ["apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "dpkg", "dpkg-deb", "dpkg-query", "pip", "pip3", "dmsetup"]
 remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"]
 lock_modules = true
 
-# Only kawa (8443) is exposed to the host. SSH stays on loopback.
+# sshd is the only inbound listener; teehost's per-VM hostfwd
+# (host:<host_port> → CVM:8443) reaches it directly.
 [firewall]
 inbound = [{ port = 8443, proto = "tcp" }]
 outbound = "deny"
-
-# Runtime env for kawa's systemd unit. No UPSTREAM_URL — kawa runs
-# standalone (any /v1/* request returns the standalone stub) and the
-# only thing this kawa actually serves is tunnel.open to port 22.
-[config_env]
-KAWA_STANDALONE = "true"
-KAWA_TUNNEL_PORTS = "22"
-ENABLE_PQ = "true"
 
 [services]
 
@@ -71,14 +69,10 @@ description = "Kernel Configuration File System"
 condition_path_exists = "/sys/kernel/config"
 
 # Generate a fresh ed25519 host key into /run/sshd-keys (tmpfs) at every
-# boot. konnect-proxy users pass StrictHostKeyChecking=no because the
-# outer kawa attestation already proved the CVM identity — embedding a
-# long-lived private host key in a public rootfs would be the wrong trade.
-#
-# RuntimeDirectory creates /run/sshd-keys (tmpfs, writable for this unit)
-# and RuntimeDirectoryPreserve=yes keeps it after the oneshot exits so
-# sshd can read the host key. RemainAfterExit goes via extra_options
-# because cvmbuild has no top-level field for it.
+# boot. Operators pass StrictHostKeyChecking=no since attestation is the
+# identity anchor (verified post-SSH via configfs-tsm), not the SSH host
+# key. Embedding a long-lived host private key in a public rootfs would
+# be the wrong trade.
 [[services.units]]
 name = "sshd-keygen"
 description = "Generate sshd host keys into /run/sshd-keys"
@@ -94,22 +88,24 @@ extra_options = [
 ]
 
 # sshd unit notes:
-# - All sshd_config knobs are passed via -o so we don't depend on the
-#   /etc/ssh/sshd_config.d/*.conf Include path being honoured (it usually
-#   is on Ubuntu, but command-line flags are bulletproof and visible in
-#   ps output for debugging).
+# - Listens on 0.0.0.0:8443 (matches teehost's hostfwd target so no
+#   teehost code change is required to reach it from outside).
+# - All sshd_config knobs passed via -o flags so we don't depend on
+#   /etc/ssh/sshd_config.d/*.conf Include behaviour. Visible in `ps`,
+#   bulletproof for debugging.
 # - PidFile lives under RuntimeDirectory=sshd → /run/sshd is writable;
 #   default /run/sshd.pid would fail because hardening=minimal applies
 #   ProtectSystem=strict, which makes /run read-only outside RW paths.
-# - PubkeyAuthentication=yes + AuthorizedKeysFile + the kawiri-test
-#   pubkey baked into /root/.ssh/authorized_keys (via [overlay.files])
-#   are what authenticates the SSH user.
+# - BindReadOnlyPaths overmounts /etc/passwd inside sshd's namespace
+#   with the version that has root=bash (cvmbuild's hardening rewrites
+#   the real /etc/passwd to set every login shell to nologin, which
+#   would make sshd accept the auth then exec "account not available").
 [[services.units]]
 name = "sshd"
-description = "OpenSSH server (loopback only — reachable via kawa tunnel)"
+description = "OpenSSH server (the only inbound surface — direct SSH)"
 exec = """\
 /usr/sbin/sshd -D -e \
--o ListenAddress=127.0.0.1 -o Port=22 \
+-o ListenAddress=0.0.0.0 -o Port=8443 \
 -o HostKey=/run/sshd-keys/ssh_host_ed25519_key \
 -o PidFile=/run/sshd/sshd.pid \
 -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password \
@@ -120,52 +116,11 @@ after = ["sshd-keygen.service", "network-online.target"]
 requires = ["sshd-keygen.service"]
 wants = ["network-online.target"]
 hardening = "minimal"
-# extra_options notes:
-# - RuntimeDirectory=sshd creates /run/sshd writable so PidFile= succeeds
-#   under hardening=minimal's ProtectSystem=strict (which would otherwise
-#   make /run read-only).
-# - BindReadOnlyPaths overmounts /etc/passwd inside sshd's namespace with
-#   the version that has root=bash (cvmbuild's hardening rewrites the
-#   real /etc/passwd to set every login shell to nologin, which would
-#   make sshd accept the auth then exec "account not available"). The
-#   user shell forked from sshd inherits the namespace so root=bash.
 extra_options = [
   "RuntimeDirectory=sshd",
   "RuntimeDirectoryMode=0755",
   "BindReadOnlyPaths=/etc/passwd.sshd:/etc/passwd",
 ]
-
-[[services.units]]
-name = "kawa"
-description = "Kawa transport (tunnel mode — relays to sshd on :22)"
-exec = "/usr/local/bin/kawa"
-after = ["sshd.service", "sys-kernel-config.mount", "network-online.target", "lock-modules.service"]
-requires = ["sys-kernel-config.mount"]
-wants = ["network-online.target", "sshd.service"]
-environment_file = "/mnt/config/config.env"
-unset_environment = ["LD_PRELOAD", "LD_LIBRARY_PATH"]
-hardening = "full"
-read_write_paths = ["/sys/kernel/config"]
-device_allow = ["/dev/sev-guest rw", "/dev/tdx-guest rw"]
-extra_options = [
-  "MemoryDenyWriteExecute=yes",
-  "InaccessiblePaths=/dev/shm",
-  "ProtectKernelTunables=no",
-  "StartLimitBurst=5",
-  "StartLimitIntervalSec=60",
-]
-
-# Single config disk (env vars only — no models, no inference).
-[[verity_disks]]
-name = "config"
-device = "vdb"
-mountpoint = "/mnt/config"
-description = "configuration disk"
-
-# No [overlay.files] block — overlay tree is COPY'd directly in the
-# Dockerfile because cvmbuild resolves overlay src paths relative to its
-# own CWD (teehost's invocation dir), not the image directory. Docker
-# COPY against the build context is the unambiguous path.
 
 [manifest]
 
@@ -178,19 +133,14 @@ ovmf_file = "OVMF_TDX.fd"
 
 [assert]
 profile = "production"
-# kawa needs ProtectKernelTunables=no for /sys/kernel/config writes; sshd
-# runs at hardening = "minimal" because pam + /etc/passwd + root login
-# don't coexist with the locked-down profile (the catalog's
+# sshd runs at hardening = "minimal" because pam + /etc/passwd + root
+# login don't coexist with the locked-down profile (the catalog's
 # service_hardening_full_or_minimal check accepts "minimal" — no exclude
-# needed there). The kawa unit stays at full hardening so the trust-
-# boundary process stays tight.
+# needed there).
 #
 # no_shells / no_shells_extended are excluded because this image's whole
-# point is to give the SSH user an interactive shell. apt/dpkg/pip/dmsetup
-# are still removed (the read-only verity rootfs makes apt-install a no-op
-# anyway, removing pip cuts a common attacker tooling starting point).
+# point is to give the SSH user an interactive shell.
 exclude = [
-  "service_no_protect_kernel_tunables_off",
   "no_shells",
   "no_shells_extended",
 ]

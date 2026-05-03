@@ -41,11 +41,6 @@ pub struct Config {
     #[allow(dead_code)] // parsed from TEE_PLATFORM env, consumed by future platform routing
     pub tee_platform: String,
     pub standalone: bool,
-    /// Loopback ports kawa will accept tunnel.open requests for. Empty list
-    /// (the default) means tunnel mode is disabled entirely; clients that send
-    /// `tunnel.open` get back `tunnel.error`. Populated from the comma-
-    /// separated KAWA_TUNNEL_PORTS env var (e.g. "22" for an ssh CVM).
-    pub tunnel_ports: Vec<u16>,
 }
 
 impl Config {
@@ -64,14 +59,6 @@ impl Config {
             standalone: env::var("KAWA_STANDALONE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
-            tunnel_ports: env::var("KAWA_TUNNEL_PORTS")
-                .ok()
-                .map(|v| {
-                    v.split(',')
-                        .filter_map(|s| s.trim().parse::<u16>().ok())
-                        .collect()
-                })
-                .unwrap_or_default(),
         }
     }
 
