@@ -31,6 +31,12 @@ RUN apt-get update && \
 RUN systemctl disable ssh.socket ssh.service 2>/dev/null || true \
     && rm -f /etc/ssh/sshd_config.d/*.conf
 
+# Ubuntu's base image ships root with shell=/usr/sbin/nologin. sshd will
+# happily accept pubkey auth and then exec nologin, which prints "This
+# account is currently not available" and exits. Give root /bin/bash so
+# the SSH session actually drops into a shell.
+RUN sed -i 's,^root:x:0:0:root:/root:/usr/sbin/nologin$,root:x:0:0:root:/root:/bin/bash,' /etc/passwd
+
 # Bake the overlay tree directly into the rootfs via Docker COPY rather
 # than cvmbuild's [overlay.files] mechanism — cvmbuild resolves overlay
 # src paths relative to its CWD (teehost's working dir), so the explicit
