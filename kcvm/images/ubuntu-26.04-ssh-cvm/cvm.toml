@@ -129,7 +129,10 @@ ovmf_file = "OVMF_TDX.fd"
 
 [assert]
 profile = "production"
-# sshd's hardening is "minimal" — pam, /etc/passwd, and root login don't
-# coexist with the locked-down service profile. The kawa unit still uses
-# full hardening so the trust-boundary process stays tight.
-exclude = ["service_no_protect_kernel_tunables_off", "service_hardening_full"]
+# kawa needs ProtectKernelTunables=no for /sys/kernel/config writes; sshd
+# runs at hardening = "minimal" because pam + /etc/passwd + root login
+# don't coexist with the locked-down profile (the catalog's
+# service_hardening_full_or_minimal check accepts "minimal" — no exclude
+# needed there). The kawa unit stays at full hardening so the trust-
+# boundary process stays tight.
+exclude = ["service_no_protect_kernel_tunables_off"]
