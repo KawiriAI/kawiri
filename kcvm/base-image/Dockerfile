@@ -2,10 +2,15 @@
 #
 # Self-contained Dockerfile: cvmbuild does NOT stage anything into this build
 # context. The contract is:
-#   - Pass APT_MIRROR / APT_SNAPSHOT / KAWA_VERSION / KAWA_VARIANT via
+#   - Pass APT_MIRROR / APT_SNAPSHOT / KAWA_VERSION via
 #     `docker build --build-arg`, or use the defaults baked here.
 #   - cvmbuild's role is to invoke `docker buildx build`, extract, package,
 #     and measure — it does not modify Dockerfiles or stage binaries.
+#
+# kawa is shipped as a single binary that auto-detects whether the kernel
+# offers a usable configfs-tsm TSM provider at boot. Real TEE hardware →
+# signed quotes; non-TEE → loud per-message mock-attestation warnings.
+# There is no `KAWA_VARIANT` build-arg anymore — one binary, one image.
 #
 # dm-verity root activation uses systemd's standard pipeline (no custom
 # dracut module): apt brings in `systemd-cryptsetup` (provides
@@ -34,10 +39,8 @@ ARG APT_MIRROR=http://snapshot.ubuntu.com
 # Kernel ABI pinned literally (no HWE meta) so cvm-base and cvm-gpu-base
 # stay in lockstep with linux-modules-nvidia-XXX-open-<ABI>-generic.
 ARG KERNEL_ABI=7.0.0-14-generic
-# kawa pin. KAWA_VARIANT="kawa" → production binary; "kawa-mocktee" → mock
-# attestation binary for protocol e2e tests on hardware without a TEE.
+# kawa pin — one binary that runtime-detects TEE backing.
 ARG KAWA_VERSION=0.1.1
-ARG KAWA_VARIANT=kawa
 
 FROM ${UBUNTU_IMAGE} AS final
 
@@ -48,7 +51,6 @@ ARG APT_SNAPSHOT
 ARG APT_MIRROR
 ARG KERNEL_ABI
 ARG KAWA_VERSION
-ARG KAWA_VARIANT
 
 # Apt mirror via build-arg (not secret): the URL becomes part of the layer
 # fingerprint, but as long as APT_MIRROR is stable across runs (either the
@@ -105,12 +107,12 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
 # --- Fetch kawa binary from the kawiri release that matches KAWA_VERSION ---
-# Authored as part of this Dockerfile rather than staged by cvmbuild — keeps
-# cvmbuild distro/project agnostic. KAWA_VARIANT picks "kawa" (production)
-# vs "kawa-mocktee" (deterministic fake reports for e2e tests). The release
-# tag is always `kawa-v${KAWA_VERSION}`; the asset name carries the variant.
+# Single binary, no variant: kawa runtime-detects whether configfs-tsm offers
+# a real TSM provider at startup and picks attestation mode accordingly.
+# Production deployments rely on konnect's KattValidator rejecting any payload
+# with platform=="mock" (its default).
 RUN set -euo pipefail \
-    && url="https://github.com/KawiriAI/kawiri/releases/download/kawa-v${KAWA_VERSION}/${KAWA_VARIANT}-v${KAWA_VERSION}-linux-x86_64.tar.gz" \
+    && url="https://github.com/KawiriAI/kawiri/releases/download/kawa-v${KAWA_VERSION}/kawa-v${KAWA_VERSION}-linux-x86_64.tar.gz" \
     && echo "fetching ${url}" \
     && curl -fsSL "${url}" -o /tmp/kawa.tar.gz \
     && mkdir -p /tmp/kawa-extract \
