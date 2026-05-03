@@ -1,0 +1,19 @@
+{
+  "name": "@kawiri/konnect-proxy",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "konnect-proxy": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@kawiri/konnect": "file:../konnect"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.11",
+    "typescript": "^6.0.2"
+  }
+}
