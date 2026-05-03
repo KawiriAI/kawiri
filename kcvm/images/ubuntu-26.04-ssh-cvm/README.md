@@ -1,15 +1,15 @@
 # ubuntu-26.04-ssh-cvm
 
 A confidential VM with direct SSH. The CVM exposes one TCP port (sshd on
-8443, matching teehost's per-VM hostfwd target so no teehost change is
-needed). Operators connect with any standard SSH client and verify the
-launch measurement post-login by reading `/sys/kernel/config/tsm/report`
-inside the CVM.
+22 — declared via `[network].expose_port` in cvm.toml so teehost's
+hostfwd targets it directly). Operators connect with any standard SSH
+client and verify the launch measurement post-login by reading
+`/sys/kernel/config/tsm/report` inside the CVM.
 
 ```
 operator                    teehost host                  CVM
 ┌────────┐  ssh -p 18443  ┌──────────────┐  qemu hostfwd  ┌──────────────┐
-│ ssh    │ ─────────────▶ │ :18443 → :8443│ ─────────────▶ │ sshd  :8443  │
+│ ssh    │ ─────────────▶ │ :18443 → :22 │ ─────────────▶ │ sshd  :22    │
 │        │ ◀───────────── │              │ ◀───────────── │              │
 └────────┘                └──────────────┘                │ /bin/bash    │
                                                           │ verity / RO  │
@@ -120,10 +120,14 @@ image identity, not a shared recipe.
   image's whole point is to give a shell, so we exclude those checks.
   apt/dpkg/pip/dmsetup are still stripped — verity rootfs makes
   apt-install a no-op anyway.
-- **sshd on port 8443 instead of 22**: teehost's per-VM hostfwd target is
-  hardcoded to 8443 (it was the kawa convention). Rather than add a
-  per-image port to teehost, sshd binds 8443 inside the CVM. From
-  outside it's invisible — operators just `ssh -p <host_port>`.
+- **sshd on port 22 (and `[network]` block in cvm.toml)**: teehost reads
+  `[network].expose_port` from each image's cvm.toml and uses it as the
+  guest-side hostfwd target, so this image gets a normal SSH port
+  inside. The `probe = "tcp"` field tells teehost to liveness-check by
+  connecting to the port instead of running the kawa /health probe (which
+  would hang since there's no kawa here). Inference images that don't
+  declare `[network]` keep working unchanged via the back-compat default
+  (kawa on 8443).
 
 ## Files
 

@@ -50,11 +50,21 @@ remove = ["apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "d
 remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"]
 lock_modules = true
 
-# sshd is the only inbound listener; teehost's per-VM hostfwd
-# (host:<host_port> → CVM:8443) reaches it directly.
+# sshd is the only inbound listener; teehost's per-VM hostfwd targets
+# CVM:22 (declared in [network] below) so this image looks like normal
+# SSH from outside.
 [firewall]
-inbound = [{ port = 8443, proto = "tcp" }]
+inbound = [{ port = 22, proto = "tcp" }]
 outbound = "deny"
+
+# teehost reads [network] to decide:
+#   1. Which CVM-side port to wire its hostfwd to (host:<host_port> → :22)
+#   2. How to liveness-probe the VM. "tcp" just connects to expose_port —
+#      no kawa-specific HTTP probe, no /health, no /mode. The UI shows a
+#      generic "ready/waiting" dot instead of the kawa attestation pill.
+[network]
+expose_port = 22
+probe = "tcp"
 
 [services]
 
@@ -88,8 +98,9 @@ extra_options = [
 ]
 
 # sshd unit notes:
-# - Listens on 0.0.0.0:8443 (matches teehost's hostfwd target so no
-#   teehost code change is required to reach it from outside).
+# - Listens on 0.0.0.0:22 — teehost's hostfwd is now per-image
+#   ([network].expose_port above), so no need to ride the legacy 8443
+#   convention. Operators just `ssh -p <host_port> root@host`.
 # - All sshd_config knobs passed via -o flags so we don't depend on
 #   /etc/ssh/sshd_config.d/*.conf Include behaviour. Visible in `ps`,
 #   bulletproof for debugging.
@@ -105,7 +116,7 @@ name = "sshd"
 description = "OpenSSH server (the only inbound surface — direct SSH)"
 exec = """\
 /usr/sbin/sshd -D -e \
--o ListenAddress=0.0.0.0 -o Port=8443 \
+-o ListenAddress=0.0.0.0 -o Port=22 \
 -o HostKey=/run/sshd-keys/ssh_host_ed25519_key \
 -o PidFile=/run/sshd/sshd.pid \
 -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password \
