@@ -1,7 +1,7 @@
 import type { SevVerifyOptions, SevVerifyResult, TdxVerifyOptions, TdxVerifyResult } from "@katt/index.ts";
 import { fetchVcek, parseSevReport, verifySevReport, verifyTdxQuote } from "@katt/index.ts";
 import type { AttestationPayload } from "../transport/types.ts";
-import type { AttestationValidator } from "./validator.ts";
+import type { AttestationValidator, ValidationResult } from "./validator.ts";
 
 /** Expected measurements to verify against (from build manifest). */
 export interface ExpectedMeasurements {
@@ -43,27 +43,31 @@ export interface KattValidatorOptions {
 export class KattValidator implements AttestationValidator {
   constructor(private opts: KattValidatorOptions = {}) {}
 
-  async validate(payload: AttestationPayload, serverStaticKey: Uint8Array): Promise<boolean> {
-    // Mock attestation: only accept if explicitly allowed
+  async validate(payload: AttestationPayload, serverStaticKey: Uint8Array): Promise<ValidationResult> {
+    // Mock attestation: only accept if explicitly allowed.
+    // Default (allowMock !== true) is to REJECT — the user-design boundary
+    // is "konnect must opt into mock", which keeps production validators
+    // safe even though the kawa binary now ships with mock paths compiled in.
     if (payload.platform === "mock") {
       if (this.opts.allowMock === true) {
         console.warn(
-          "[kawiri] ⚠ MOCK ATTESTATION — connection is NOT running in a confidential TEE. " +
-            "Data is not hardware-protected. Do not use in production.",
+          "[kawiri] ⚠ MOCK ATTESTATION accepted — server is NOT running in a confidential TEE. " +
+            "Data is not hardware-protected. Every message on this connection will WARN. " +
+            "Do not use in production.",
         );
-        return true;
+        return { valid: true, mode: "mock" };
       }
-      return false;
+      return { valid: false, mode: "mock" };
     }
 
     if (!payload.quote) {
-      return false;
+      return { valid: false, mode: "real" };
     }
 
     // Verify nonce: must equal SHA-256(serverStaticKey) in hex
     const expectedNonce = await sha256Hex(serverStaticKey);
     if (payload.nonce !== expectedNonce) {
-      return false;
+      return { valid: false, mode: "real" };
     }
 
     // Decode the quote from base64
@@ -74,13 +78,13 @@ export class KattValidator implements AttestationValidator {
     const reportData = new Uint8Array(64);
     reportData.set(nonceBytes);
 
+    let valid = false;
     if (payload.platform === "TDX") {
-      return this.verifyTdx(quoteBytes, reportData);
+      valid = await this.verifyTdx(quoteBytes, reportData);
     } else if (payload.platform === "SEV-SNP") {
-      return this.verifySev(quoteBytes, reportData, payload.certChain);
+      valid = await this.verifySev(quoteBytes, reportData, payload.certChain);
     }
-
-    return false;
+    return { valid, mode: "real" };
   }
 
   private async verifyTdx(quoteBytes: Uint8Array, reportData: Uint8Array): Promise<boolean> {

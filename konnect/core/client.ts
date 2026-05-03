@@ -48,6 +48,12 @@ export class KawiriClient {
   private options: Required<KawiriClientOptions>;
   private _connected = false;
   private _timing: ConnectTiming | null = null;
+  /**
+   * True when the validator accepted a `platform: "mock"` attestation.
+   * Drives the per-message warnings — every send and every recv emits a
+   * `console.warn` so an operator skimming devtools can't miss it.
+   */
+  private isMockConnection = false;
 
   constructor(opts: KawiriClientOptions) {
     this.options = {
@@ -162,13 +168,20 @@ export class KawiriClient {
 
             // Validate attestation
             const tValidate = performance.now();
-            const valid = await this.options.validator.validate(attestation, remoteStatic);
+            const result = await this.options.validator.validate(attestation, remoteStatic);
             timing.validation = performance.now() - tValidate;
             dbg(`[kawiri] attestation validation: ${timing.validation.toFixed(0)}ms`);
-            if (!valid) {
+            if (!result.valid) {
               ws.close(4008, "Attestation validation failed");
               doSettle(false, new Error("Attestation validation failed"));
               return;
+            }
+            this.isMockConnection = result.mode === "mock";
+            if (this.isMockConnection) {
+              console.warn(
+                "[kawiri] ⚠ Connection established to MOCK kawa — no TEE attestation. " +
+                  "Every message on this connection will emit a warning. Production validators reject this.",
+              );
             }
 
             // msg 2: send our static + split
@@ -261,6 +274,9 @@ export class KawiriClient {
 
   private async handleTransportMessage(data: Uint8Array): Promise<void> {
     if (!this.transport) throw new Error("transport not established");
+    if (this.isMockConnection) {
+      console.warn("[kawiri] ⚠ recv on MOCK connection (no TEE backing this transport)");
+    }
     const plainFrame = await this.transport.decrypt(data);
     const decoded = Framer.decode(plainFrame);
 
@@ -346,6 +362,9 @@ export class KawiriClient {
   private async sendRequest(req: KawiriRequest): Promise<void> {
     if (!this._connected || !this.transport || !this.ws) {
       throw new Error("Not connected");
+    }
+    if (this.isMockConnection) {
+      console.warn("[kawiri] ⚠ send on MOCK connection (no TEE backing this transport)");
     }
     const json = JSON.stringify(req);
     const data = new TextEncoder().encode(json);
