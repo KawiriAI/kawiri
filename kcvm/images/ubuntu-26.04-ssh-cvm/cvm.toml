@@ -123,6 +123,14 @@ hardening = "minimal"
 extra_options = [
   "RuntimeDirectory=sshd",
   "RuntimeDirectoryMode=0755",
+  # See Dockerfile comment: cvmbuild's hardening rewrites root's shell in
+  # /etc/passwd to nologin, which would make sshd accept the pubkey auth
+  # and then exec a "this account is currently not available" stub. Bind
+  # /etc/passwd.sshd (with root=bash) over /etc/passwd in sshd's mount
+  # namespace only — the user shell inherits sshd's namespace via fork+
+  # exec, so it also sees root=bash. The system-wide /etc/passwd still
+  # has root=nologin so other services don't notice.
+  "BindReadOnlyPaths=/etc/passwd.sshd:/etc/passwd",
 ]
 
 [[services.units]]

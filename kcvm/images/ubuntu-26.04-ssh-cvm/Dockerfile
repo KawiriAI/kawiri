@@ -31,11 +31,15 @@ RUN apt-get update && \
 RUN systemctl disable ssh.socket ssh.service 2>/dev/null || true \
     && rm -f /etc/ssh/sshd_config.d/*.conf
 
-# Ubuntu's base image ships root with shell=/usr/sbin/nologin. sshd will
-# happily accept pubkey auth and then exec nologin, which prints "This
-# account is currently not available" and exits. Give root /bin/bash so
-# the SSH session actually drops into a shell.
-RUN sed -i 's,^root:x:0:0:root:/root:/usr/sbin/nologin$,root:x:0:0:root:/root:/bin/bash,' /etc/passwd
+# cvmbuild's hardening pass unconditionally rewrites every login shell in
+# /etc/passwd to /usr/sbin/nologin (good for chat-only CVMs, fatal for an
+# SSH-CVM). To work around it without forking cvmbuild, we bake a side-by-
+# side passwd file with root's shell set to /bin/bash at a path cvmbuild
+# leaves alone, and BindReadOnlyPaths it onto /etc/passwd inside the sshd
+# unit's mount namespace at runtime (see cvm.toml). The system-wide
+# /etc/passwd still has root=nologin so no other service is surprised.
+RUN sed 's,^root:x:0:0:root:/root:/usr/sbin/nologin$,root:x:0:0:root:/root:/bin/bash,' /etc/passwd > /etc/passwd.sshd \
+    && chmod 644 /etc/passwd.sshd
 
 # Bake the overlay tree directly into the rootfs via Docker COPY rather
 # than cvmbuild's [overlay.files] mechanism — cvmbuild resolves overlay
