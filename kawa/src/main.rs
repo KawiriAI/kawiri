@@ -14,6 +14,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Version banner — first thing in the log so "is this the right kawa?"
+    // is answerable from the very top of any boot output, no scrolling.
+    info!(
+        "kawa v{} (build target: {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    );
+
     let cfg = config::Config::from_env();
     info!(
         port = cfg.port,
