@@ -198,3 +198,22 @@ args = [
 os.execv(sys.executable, args)
 LAUNCHER
 RUN chmod 755 /usr/local/bin/vllm-launcher
+
+# --- Reproducibility purge (mirrors cvm-base) ---
+# Wipe wallclock-tainted files left behind by this final stage's apt/dpkg activity.
+RUN rm -f /var/lib/dbus/machine-id \
+          /var/log/apt/history.log \
+          /var/log/apt/term.log \
+          /var/log/apt/eipp.log.xz \
+          /var/log/dpkg.log \
+          /var/log/alternatives.log \
+          /var/log/bootstrap.log \
+          /etc/ld.so.cache \
+          /var/cache/ldconfig/aux-cache
+
+# --- Restore stock apt config from the unmodified base image ---
+# cvm-base set up snapshot-pinned sources for build; here we revert so the
+# sealed rootfs has stock Ubuntu apt config (operator-independent, valid for
+# post-build apt usage in non-CVM scenarios).
+COPY --from=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4 /etc/apt/sources.list                  /etc/apt/sources.list
+COPY --from=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4 /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
