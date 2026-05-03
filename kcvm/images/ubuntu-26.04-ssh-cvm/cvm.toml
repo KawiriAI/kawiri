@@ -151,7 +151,12 @@ profile = "production"
 #
 # no_shells / no_shells_extended are excluded because this image's whole
 # point is to give the SSH user an interactive shell.
+#
+# firewall_no_ssh is excluded because SSH on port 22 IS the inbound surface
+# for this image. The assert is appropriate for chat-only CVMs that should
+# never expose 22; here it would block the entire image.
 exclude = [
   "no_shells",
   "no_shells_extended",
+  "firewall_no_ssh",
 ]
