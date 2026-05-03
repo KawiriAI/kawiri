@@ -40,10 +40,7 @@ ARG APT_MIRROR=http://snapshot.ubuntu.com
 # stay in lockstep with linux-modules-nvidia-XXX-open-<ABI>-generic.
 ARG KERNEL_ABI=7.0.0-14-generic
 # kawa pin — one binary that runtime-detects TEE backing.
-# v0.2.0 introduces tunnel mode (byte relay to loopback ports inside the
-# CVM, gated by KAWA_TUNNEL_PORTS allowlist). chat-only CVMs that don't
-# set the env var keep their existing behaviour bit-for-bit.
-ARG KAWA_VERSION=0.2.0
+ARG KAWA_VERSION=0.1.4
 
 FROM ${UBUNTU_IMAGE} AS final
 
