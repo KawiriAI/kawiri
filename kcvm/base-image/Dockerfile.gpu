@@ -38,6 +38,7 @@
 
 ARG UBUNTU_IMAGE=docker.io/library/ubuntu:26.04@sha256:5e275723f82c67e387ba9e3c24baa0abdcb268917f276a0561c97bef9450d0b4
 ARG APT_SNAPSHOT=20260501T000000Z
+ARG APT_MIRROR=http://snapshot.ubuntu.com
 # Kernel ABI pinned literally — must match cvm-base's linux-modules-${KERNEL_ABI}
 ARG KERNEL_ABI=7.0.0-14-generic
 # NVIDIA driver: branch + exact version. The version pin must match between
@@ -57,6 +58,7 @@ SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
 ARG APT_SNAPSHOT
+ARG APT_MIRROR
 ARG KERNEL_ABI
 ARG NVIDIA_DRIVER_BRANCH
 ARG NVIDIA_DRIVER_VERSION
@@ -64,20 +66,8 @@ ARG NVIDIA_CUDA_REPO
 ARG NVIDIA_FABRICMANAGER_SHA256
 ARG NVIDIA_NSCQ_SHA256
 
-# Re-pin apt sources for this build's cache proxy. cvm-base bakes the previous
-# session's proxy URL; without re-pinning, apt-get update tries to reach a
-# long-dead port. The proxy URL comes in as a BuildKit secret (see cvm-base
-# Dockerfile for the full reasoning).
-RUN --mount=type=secret,id=apt_mirror,target=/run/secrets/apt_mirror \
-    APT_MIRROR=$(cat /run/secrets/apt_mirror) && \
-    rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list && \
-    { echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute main restricted universe multiverse"; \
-      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-updates main restricted universe multiverse"; \
-      echo "deb [check-date=no] ${APT_MIRROR}/ubuntu/${APT_SNAPSHOT} resolute-security main restricted universe multiverse"; \
-    } > /etc/apt/sources.list && \
-    { echo 'Acquire::Check-Valid-Until "false";'; \
-      echo 'Acquire::https::Verify-Peer "false";'; \
-    } > /etc/apt/apt.conf.d/99snapshot
+# Inherit cvm-base's already-set-up sources.list (snapshot-pinned, possibly
+# routed via APT_MIRROR proxy). No re-stamp needed.
 
 # Canonical-signed NVIDIA stack:
 #   linux-modules-nvidia-${BRANCH}-open-${KERNEL_ABI}
@@ -228,3 +218,16 @@ TimeoutStartSec=60
 WantedBy=sysinit.target
 UNIT
 RUN systemctl enable nvidia-uvm-load.service
+
+# --- Reproducibility purge (mirrors cvm-base) ---
+# Strip wallclock-tainted files from this layer's apt/dpkg activity.
+# /etc/apt/sources.list left intact (see cvm-base Dockerfile).
+RUN rm -f /var/lib/dbus/machine-id \
+          /var/log/apt/history.log \
+          /var/log/apt/term.log \
+          /var/log/apt/eipp.log.xz \
+          /var/log/dpkg.log \
+          /var/log/alternatives.log \
+          /var/log/bootstrap.log \
+          /etc/ld.so.cache \
+          /var/cache/ldconfig/aux-cache
