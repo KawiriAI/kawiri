@@ -31,17 +31,19 @@ RUN apt-get update && \
 RUN systemctl disable ssh.socket ssh.service 2>/dev/null || true \
     && rm -f /etc/ssh/sshd_config.d/*.conf
 
-# Pre-create /run/sshd-keys mount target (sshd-keygen.service writes here).
-# /run is tmpfs at boot so this is just the directory entry on the rootfs.
-RUN mkdir -p /run/sshd-keys && chmod 700 /run/sshd-keys
+# Bake the overlay tree directly into the rootfs via Docker COPY rather
+# than cvmbuild's [overlay.files] mechanism — cvmbuild resolves overlay
+# src paths relative to its CWD (teehost's working dir), so the explicit
+# Docker COPY from the build context is the bulletproof option. The
+# build context is the kcvm/ repo root (cvm.toml's `context = "../..").
+COPY images/ubuntu-26.04-ssh-cvm/overlay/root/.ssh/authorized_keys /root/.ssh/authorized_keys
+COPY images/ubuntu-26.04-ssh-cvm/overlay/usr/local/sbin/sshd-keygen /usr/local/sbin/sshd-keygen
 
-# Pre-create /run/sshd PID-file dir for sshd's privsep (a stock Ubuntu
-# requirement; sshd refuses to start if it can't chdir there).
-RUN mkdir -p /run/sshd && chmod 755 /run/sshd
-
-# /root/.ssh is on the read-only rootfs (verity); the overlay/ tree provides
-# the authorized_keys file directly so no boot-time write is needed.
-RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+# Lock down perms (Docker COPY preserves source mode; redo here to be
+# explicit and resistant to host umask quirks).
+RUN chmod 700 /root/.ssh \
+    && chmod 600 /root/.ssh/authorized_keys \
+    && chmod 755 /usr/local/sbin/sshd-keygen
 
 # /home is empty by design — anything written there is on the read-only
 # rootfs. Operators wanting persistent state should add a [[verity_disks]]

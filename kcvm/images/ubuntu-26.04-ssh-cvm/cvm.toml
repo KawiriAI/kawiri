@@ -152,13 +152,10 @@ device = "vdb"
 mountpoint = "/mnt/config"
 description = "configuration disk"
 
-# Files copied into the rootfs after docker build. cvmbuild does NOT
-# recursively walk overlay/ — each file needs an explicit src→dst pair.
-[overlay]
-files = [
-  { src = "overlay/root/.ssh/authorized_keys", dst = "/root/.ssh/authorized_keys" },
-  { src = "overlay/usr/local/sbin/sshd-keygen", dst = "/usr/local/sbin/sshd-keygen" },
-]
+# No [overlay.files] block — overlay tree is COPY'd directly in the
+# Dockerfile because cvmbuild resolves overlay src paths relative to its
+# own CWD (teehost's invocation dir), not the image directory. Docker
+# COPY against the build context is the unambiguous path.
 
 [manifest]
 
