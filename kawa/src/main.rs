@@ -3,6 +3,7 @@ mod protocol;
 mod proxy;
 mod server;
 mod tee;
+mod tunnel;
 
 use tracing::info;
 

@@ -10,7 +10,7 @@ use hyper::{Request, Response};
 use hyper_tungstenite::tungstenite::Message;
 use hyper_tungstenite::HyperWebsocket;
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -41,9 +41,13 @@ use crate::config::Config;
 use crate::protocol::framer::{self, FrameAssembler};
 use crate::protocol::noise::{NoiseResponder, StaticKeypair};
 use crate::protocol::transport::EncryptedTransport;
-use crate::protocol::types::{KawiriRequest, KawiriResponse, KawiriStreamChunk};
+use crate::protocol::types::{
+    FirstMessagePeek, KawiriRequest, KawiriResponse, KawiriStreamChunk, TunnelError, TunnelOpen,
+    TunnelOpened,
+};
 use crate::proxy::{self, ProxyEvent};
 use crate::tee::{self, TeeMode};
+use crate::tunnel;
 
 pub async fn start_server(config: Config, tee_mode: TeeMode) -> anyhow::Result<()> {
     let static_keypair = Arc::new(StaticKeypair::generate()?);
@@ -241,6 +245,7 @@ async fn handle_websocket(
 
     // --- Phase 3: Transport message loop ---
     let mut assembler = FrameAssembler::new();
+    let mut first_message = true;
 
     loop {
         let raw: Vec<u8> = match recv_binary!(ws_stream) {
@@ -250,7 +255,9 @@ async fn handle_websocket(
 
         // Loud per-message warning in mock mode — the user-chosen audit trail.
         // Volume is intentional: every recv on a non-attested connection is one
-        // log line so an operator skimming logs can't miss it.
+        // log line so an operator skimming logs can't miss it. (In tunnel mode
+        // this fires only for the tunnel.open control message; the tunnel
+        // relay loop is silent to avoid drowning the log on busy SSH sessions.)
         if tee_mode == TeeMode::Mock {
             warn!("kawa: received message on MOCK connection (no TEE attestation backing this transport)");
         }
@@ -266,6 +273,28 @@ async fn handle_websocket(
             Some(p) => p,
             None => continue,
         };
+
+        // First complete message decides the channel mode: a JSON object
+        // with `kind:"tunnel.open"` switches us into tunnel relay mode for
+        // the rest of the connection. Anything else (no `kind` field) flows
+        // through to the existing RPC handler unchanged.
+        if first_message {
+            first_message = false;
+            if let Ok(peek) = serde_json::from_slice::<FirstMessagePeek>(&payload) {
+                if peek.kind.as_deref() == Some("tunnel.open") {
+                    handle_tunnel_open(
+                        &payload,
+                        &config,
+                        transport.as_mut(),
+                        &mut ws_sink,
+                        &mut ws_stream,
+                        tee_mode,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
 
         // Parse request
         let req: KawiriRequest = serde_json::from_slice(&payload)?;
@@ -479,6 +508,85 @@ where
     Ok(())
 }
 
+/// Handle a `tunnel.open` control message: validate against the allowlist,
+/// dial the loopback port, send back `tunnel.opened` or `tunnel.error`, then
+/// hand the transport over to the byte relay until either side closes.
+async fn handle_tunnel_open<S, R>(
+    payload: &[u8],
+    config: &Config,
+    transport: &mut dyn EncryptedTransport,
+    ws_sink: &mut S,
+    ws_stream: &mut R,
+    tee_mode: TeeMode,
+) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, hyper_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let open: TunnelOpen =
+        serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!("tunnel.open parse: {e}"))?;
+
+    if !config.tunnel_ports.contains(&open.port) {
+        let msg = format!("port {} not in tunnel allowlist", open.port);
+        warn!("tunnel.open rejected: {msg}");
+        send_tunnel_error(transport, ws_sink, &msg).await?;
+        return Ok(());
+    }
+
+    let socket = match TcpStream::connect(("127.0.0.1", open.port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("connect 127.0.0.1:{} failed: {e}", open.port);
+            warn!("tunnel.open: {msg}");
+            send_tunnel_error(transport, ws_sink, &msg).await?;
+            return Ok(());
+        }
+    };
+
+    send_tunnel_opened(transport, ws_sink).await?;
+
+    let attestation_label = match tee_mode {
+        TeeMode::Real => "real",
+        TeeMode::Mock => "MOCK",
+    };
+    info!(
+        "tunnel: opened to 127.0.0.1:{} (attestation={})",
+        open.port, attestation_label
+    );
+
+    tunnel::relay(transport, ws_sink, ws_stream, socket).await
+}
+
+async fn send_tunnel_opened<S>(
+    transport: &mut dyn EncryptedTransport,
+    ws_sink: &mut S,
+) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
+{
+    let reply = TunnelOpened {
+        kind: "tunnel.opened",
+    };
+    let bytes = serde_json::to_vec(&reply)?;
+    send_encrypted_bytes(transport, ws_sink, &bytes).await
+}
+
+async fn send_tunnel_error<S>(
+    transport: &mut dyn EncryptedTransport,
+    ws_sink: &mut S,
+    msg: &str,
+) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
+{
+    let err = TunnelError {
+        kind: "tunnel.error",
+        msg: msg.to_string(),
+    };
+    let bytes = serde_json::to_vec(&err)?;
+    send_encrypted_bytes(transport, ws_sink, &bytes).await
+}
+
 async fn handle_standalone<S>(
     req: &KawiriRequest,
     is_stream: bool,
@@ -543,8 +651,18 @@ fn log_system_info(config: &Config, tee_mode: TeeMode) {
 
     info!("kawa v{}", env!("CARGO_PKG_VERSION"));
     info!("kernel={kernel} vcpus={cpus} memory={mem}");
+    let tunnel_summary = if config.tunnel_ports.is_empty() {
+        "off".to_string()
+    } else {
+        config
+            .tunnel_ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     info!(
-        "mode={} pq={} port={} attestation={}",
+        "mode={} pq={} port={} attestation={} tunnels={}",
         if config.is_standalone() {
             "standalone"
         } else {
@@ -556,6 +674,7 @@ fn log_system_info(config: &Config, tee_mode: TeeMode) {
             TeeMode::Real => "real",
             TeeMode::Mock => "MOCK",
         },
+        tunnel_summary,
     );
 }
 
