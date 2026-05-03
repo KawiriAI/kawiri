@@ -135,4 +135,13 @@ profile = "production"
 # service_hardening_full_or_minimal check accepts "minimal" — no exclude
 # needed there). The kawa unit stays at full hardening so the trust-
 # boundary process stays tight.
-exclude = ["service_no_protect_kernel_tunables_off"]
+#
+# no_shells / no_shells_extended are excluded because this image's whole
+# point is to give the SSH user an interactive shell. apt/dpkg/pip/dmsetup
+# are still removed (the read-only verity rootfs makes apt-install a no-op
+# anyway, removing pip cuts a common attacker tooling starting point).
+exclude = [
+  "service_no_protect_kernel_tunables_off",
+  "no_shells",
+  "no_shells_extended",
+]
