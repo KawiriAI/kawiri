@@ -1,6 +1,6 @@
 {
   "buildInputs": {
-    "rootfs_roothash": "0132ee313bdf059cadeb72fccc2459047b22a8290daf314b787cb638a5cd7ff9",
+    "rootfs_roothash": "7ed88d4e90ce307975d8f94a34a78faffead63061cadc5e85e0c64904a3b5209",
     "model_roothash": "9a170aca3cdac3a821a59ab24beefcfb5e2e1f351d016c4c9e1278836d5ef60e",
     "model_hashoffset": 471867392,
     "config_roothash": "b1c017b1f1c15e42cf03ea9db6128e232f3e750bce850bc97b95f3ae45533693",
@@ -8,20 +8,20 @@
     "kernel_sha256": "6f11cd68fc0d181bb4f9a72e2d0ec6a1c2a69a59f7b9bd6bf9538630d1102456",
     "initrd_sha256": "cacf3031ce9b8dc4af38b5ffc699f58ed819d808e457248e6e685f2c9e2a21a8",
     "ovmf_sha256": "0e3e7879e4098efbccb41fea25d959e5cfff9a0526c4d61aaf2afb3560075de3",
-    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=0132ee313bdf059cadeb72fccc2459047b22a8290daf314b787cb638a5cd7ff9 console=ttyS0,115200n8 models_roothash=9a170aca3cdac3a821a59ab24beefcfb5e2e1f351d016c4c9e1278836d5ef60e models_hashoffset=471867392 config_roothash=b1c017b1f1c15e42cf03ea9db6128e232f3e750bce850bc97b95f3ae45533693 config_hashoffset=67108864"
+    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=7ed88d4e90ce307975d8f94a34a78faffead63061cadc5e85e0c64904a3b5209 console=ttyS0,115200n8 models_roothash=9a170aca3cdac3a821a59ab24beefcfb5e2e1f351d016c4c9e1278836d5ef60e models_hashoffset=471867392 config_roothash=b1c017b1f1c15e42cf03ea9db6128e232f3e750bce850bc97b95f3ae45533693 config_hashoffset=67108864"
   },
   "measurements": {
     "snp": {
-      "SNP_EPYC-Genoa": "04372bac90468f2870d6cbb672d3b76bdbdc3133f56491f089c1f8421468512ea525382159a9e5f11479cf500cc45253",
-      "SNP_EPYC-Milan": "cc1e313c21bf6fa86f8045841403f0e58462d5243fe2f97442733925c1d573bae2243b28b09f574785858f4eeddff793",
-      "SNP_EPYC-Rome": "89b92f9b9fa64e4bdbeb8f6af4553f79b7e99abce8382b12dfcbeafccf0b10b2e1556120c35cb9523f509c277d2582bb",
-      "SNP_EPYC-v4": "111fdd6567be50329cd0c478b253475a5b4e501dd5562f4d2faa10b5b5c1dda85b90d867ab0f900b1cbf20fb7142d0d6"
+      "SNP_EPYC-Genoa": "84c4c0d0d1153bb9e561548535c63a10283bcad5c96f4e4d01b8b38da86ceab44171f8b3c2f8e3d9f7c7c8ab42765ba1",
+      "SNP_EPYC-Milan": "de2cbe621d521f6c520ef8ad60f2fbbaaf14c12ea0fb2d8c2d3b8923531bb462ef6c72234319ef1f565a5f63e02b05e8",
+      "SNP_EPYC-Rome": "2c4cdd25f84cc30809ae6a95220f59063cc2dfaee5d45a1df14c69509587c4f1ba2042d4c19fd4bc43a0563787d2e51f",
+      "SNP_EPYC-v4": "239768f1753aec2675ec2bffdde9c439821f951c90d111c5858ff4578a51f6562a9a2a9b76c06faad5d1cae59fcdccc6"
     },
     "tdx": {
       "MRTD": "5295fe8c30d9b8768f207d0148ce7853ef7b59b88710b287219245bae4f36903f20b0437d94e28d2de68e50bbcd1af8c",
       "RTMR0": "ba249794529d3fb6a718610b67890ce66dc4ba164d0d4c0b55a004ec27e2170cfa0d182469cb82ab8371fbe8c936026d",
       "RTMR1": "541a512471f33287889fef747dddd6a466c6ede39c6cdae9051295ba4bd8d2f6761a385775abb470eed5c8349f88e070",
-      "RTMR2": "64c21f194d411264e4d9997354174656d4107a1ce46c08a08fd7a58365e722973307bdeb42a15f64e832a8bf7239907b",
+      "RTMR2": "d42963457fe7d2c97703c23bdbb0e95d0fbba878393ea8c5e1af57d42aee187c32beeb04b8c3b0279847c1d894d63cf0",
       "RTMR3": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     }
   },
