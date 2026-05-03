@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "kawa"
-version = "0.2.0"
+version = "0.1.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
