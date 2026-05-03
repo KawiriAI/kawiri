@@ -1,9 +1,15 @@
 name: Mirror kcvm to bucket
 
-# On push to main, mirror kcvm/{base-image,images}/ to an S3-compatible bucket.
-# Bucket layout 1:1 with the source dirs:
-#   base-image/Dockerfile
-#   images/<id>/{cvm.toml, Dockerfile, manifest.expected.json}
+# On push to main, mirror kcvm/{base-image,images}/ to an S3-compatible bucket
+# under the cvmbuild/ prefix. The bucket is shared with other teehost
+# subsystems (e.g. aptcache/) so a single bucket + IAM credential covers
+# everything teehost needs.
+#
+# Bucket layout:
+#   cvmbuild/base-image/Dockerfile
+#   cvmbuild/images/<id>/{cvm.toml, Dockerfile, manifest.expected.json}
+#   cvmbuild/images/<id>/build/...     ← teehost uploads after a local build
+#   aptcache/...                       ← teehost::aptcache mirror (out of scope here)
 #
 # build.sh and other kcvm/ siblings are excluded — the bucket holds only what
 # teehost / cvmbuild consume on a deployed host.
@@ -12,7 +18,7 @@ name: Mirror kcvm to bucket
 #   AWS_ENDPOINT_URL       — full S3 endpoint URL (any S3-compatible backend)
 #   AWS_ACCESS_KEY_ID      — credential pair, scoped to the bucket, read+write
 #   AWS_SECRET_ACCESS_KEY  — paired secret
-#   KCVM_BUCKET            — bucket name
+#   TEEHOST_BUCKET         — bucket name (single bucket for all teehost subsystems)
 
 on:
   push:
@@ -35,7 +41,7 @@ env:
   AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  KCVM_BUCKET: ${{ secrets.KCVM_BUCKET }}
+  TEEHOST_BUCKET: ${{ secrets.TEEHOST_BUCKET }}
 
 jobs:
   mirror:
@@ -46,7 +52,7 @@ jobs:
       - name: Verify required secrets are present
         run: |
           missing=0
-          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY KCVM_BUCKET; do
+          for v in AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TEEHOST_BUCKET; do
             if [ -z "${!v:-}" ]; then
               echo "::error::missing secret $v"
               missing=1
@@ -56,7 +62,7 @@ jobs:
 
       - name: Mirror base-image/
         run: |
-          aws s3 sync kcvm/base-image/ "s3://${KCVM_BUCKET}/base-image/" \
+          aws s3 sync kcvm/base-image/ "s3://${TEEHOST_BUCKET}/cvmbuild/base-image/" \
             --delete --no-progress
 
       - name: Mirror images/
@@ -65,9 +71,32 @@ jobs:
         # prefix after a successful local build. CI only owns the source files
         # (cvm.toml, Dockerfile, manifest.expected.json); teehost owns build/.
         run: |
-          aws s3 sync kcvm/images/ "s3://${KCVM_BUCKET}/images/" \
+          aws s3 sync kcvm/images/ "s3://${TEEHOST_BUCKET}/cvmbuild/images/" \
             --delete --no-progress \
             --exclude '*/build/*'
+
+      - name: Reap orphaned image prefixes
+        # When an image directory is deleted from git, the previous step
+        # removes its source files but leaves any teehost-uploaded
+        # build/ artifacts orphaned (because of --exclude '*/build/*').
+        # Catch that: enumerate top-level image prefixes in S3, remove
+        # any that no longer exist in the git tree. Recursive rm wipes
+        # the entire prefix including build/.
+        run: |
+          set -euo pipefail
+          GIT_IMGS=$(ls kcvm/images/ 2>/dev/null | sort)
+          S3_IMGS=$(aws s3 ls "s3://${TEEHOST_BUCKET}/cvmbuild/images/" \
+            | awk '/PRE/ {print $2}' | sed 's:/$::' | sort)
+          ORPHANS=$(comm -23 <(echo "$S3_IMGS") <(echo "$GIT_IMGS") || true)
+          if [ -z "$ORPHANS" ]; then
+            echo "no orphaned image prefixes."
+            exit 0
+          fi
+          while IFS= read -r img; do
+            [ -z "$img" ] && continue
+            echo "reaping orphaned image prefix: $img"
+            aws s3 rm --recursive "s3://${TEEHOST_BUCKET}/cvmbuild/images/${img}/"
+          done <<< "$ORPHANS"
 
       - name: Job summary
         if: always()
@@ -75,6 +104,7 @@ jobs:
           {
             echo "### kcvm mirror"
             echo ""
-            echo "- Bucket: \`${KCVM_BUCKET}\`"
+            echo "- Bucket: \`${TEEHOST_BUCKET}\`"
+            echo "- Prefix: \`cvmbuild/\`"
             echo "- Commit: \`${GITHUB_SHA:0:12}\`"
           } >> "$GITHUB_STEP_SUMMARY"
