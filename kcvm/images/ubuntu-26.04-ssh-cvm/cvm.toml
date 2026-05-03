@@ -70,26 +70,60 @@ type = "configfs"
 description = "Kernel Configuration File System"
 condition_path_exists = "/sys/kernel/config"
 
-# Generate a fresh ed25519 host key into tmpfs at every boot. konnect-proxy
-# users pass StrictHostKeyChecking=no because the outer kawa attestation
-# already proved the CVM identity — embedding a long-lived private host
-# key in a public rootfs would be the wrong trade.
+# Generate a fresh ed25519 host key into /run/sshd-keys (tmpfs) at every
+# boot. konnect-proxy users pass StrictHostKeyChecking=no because the
+# outer kawa attestation already proved the CVM identity — embedding a
+# long-lived private host key in a public rootfs would be the wrong trade.
+#
+# RuntimeDirectory creates /run/sshd-keys (tmpfs, writable for this unit)
+# and RuntimeDirectoryPreserve=yes keeps it after the oneshot exits so
+# sshd can read the host key. RemainAfterExit goes via extra_options
+# because cvmbuild has no top-level field for it.
 [[services.units]]
 name = "sshd-keygen"
 description = "Generate sshd host keys into /run/sshd-keys"
 exec = "/usr/local/sbin/sshd-keygen"
-type = "oneshot"
-remain_after_exit = true
+service_type = "oneshot"
+hardening = "minimal"
 after = ["local-fs.target"]
+extra_options = [
+  "RemainAfterExit=yes",
+  "RuntimeDirectory=sshd-keys",
+  "RuntimeDirectoryMode=0700",
+  "RuntimeDirectoryPreserve=yes",
+]
 
+# sshd unit notes:
+# - All sshd_config knobs are passed via -o so we don't depend on the
+#   /etc/ssh/sshd_config.d/*.conf Include path being honoured (it usually
+#   is on Ubuntu, but command-line flags are bulletproof and visible in
+#   ps output for debugging).
+# - PidFile lives under RuntimeDirectory=sshd → /run/sshd is writable;
+#   default /run/sshd.pid would fail because hardening=minimal applies
+#   ProtectSystem=strict, which makes /run read-only outside RW paths.
+# - PubkeyAuthentication=yes + AuthorizedKeysFile + the kawiri-test
+#   pubkey baked into /root/.ssh/authorized_keys (via [overlay.files])
+#   are what authenticates the SSH user.
 [[services.units]]
 name = "sshd"
 description = "OpenSSH server (loopback only — reachable via kawa tunnel)"
-exec = "/usr/sbin/sshd -D -e"
+exec = """\
+/usr/sbin/sshd -D -e \
+-o ListenAddress=127.0.0.1 -o Port=22 \
+-o HostKey=/run/sshd-keys/ssh_host_ed25519_key \
+-o PidFile=/run/sshd/sshd.pid \
+-o PasswordAuthentication=no -o PermitRootLogin=prohibit-password \
+-o PubkeyAuthentication=yes -o AuthorizedKeysFile=/root/.ssh/authorized_keys \
+-o UsePAM=no -o X11Forwarding=no -o AllowAgentForwarding=no -o AllowTcpForwarding=no\
+"""
 after = ["sshd-keygen.service", "network-online.target"]
 requires = ["sshd-keygen.service"]
 wants = ["network-online.target"]
 hardening = "minimal"
+extra_options = [
+  "RuntimeDirectory=sshd",
+  "RuntimeDirectoryMode=0755",
+]
 
 [[services.units]]
 name = "kawa"
@@ -117,6 +151,14 @@ name = "config"
 device = "vdb"
 mountpoint = "/mnt/config"
 description = "configuration disk"
+
+# Files copied into the rootfs after docker build. cvmbuild does NOT
+# recursively walk overlay/ — each file needs an explicit src→dst pair.
+[overlay]
+files = [
+  { src = "overlay/root/.ssh/authorized_keys", dst = "/root/.ssh/authorized_keys" },
+  { src = "overlay/usr/local/sbin/sshd-keygen", dst = "/usr/local/sbin/sshd-keygen" },
+]
 
 [manifest]
 
