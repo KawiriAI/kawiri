@@ -53,10 +53,6 @@ libc = "0.2"
 # vsock (teehost connectivity)
 tokio-vsock = "0.6"
 
-[features]
-default = []
-mock = []  # Enable mock attestation (dev/testing only — never enable in production images)
-
 [profile.release]
 strip = true
 lto = true

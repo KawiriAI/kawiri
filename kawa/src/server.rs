@@ -43,13 +43,13 @@ use crate::protocol::noise::{NoiseResponder, StaticKeypair};
 use crate::protocol::transport::EncryptedTransport;
 use crate::protocol::types::{KawiriRequest, KawiriResponse, KawiriStreamChunk};
 use crate::proxy::{self, ProxyEvent};
-use crate::tee;
+use crate::tee::{self, TeeMode};
 
-pub async fn start_server(config: Config) -> anyhow::Result<()> {
+pub async fn start_server(config: Config, tee_mode: TeeMode) -> anyhow::Result<()> {
     let static_keypair = Arc::new(StaticKeypair::generate()?);
 
     // ── Boot banner ──────────────────────────────────────────────
-    log_system_info(&config);
+    log_system_info(&config, tee_mode);
 
     let config = Arc::new(config);
     let http_client = Arc::new(reqwest::Client::new());
@@ -62,10 +62,12 @@ pub async fn start_server(config: Config) -> anyhow::Result<()> {
     }
 
     // Pre-generate and cache TEE attestation so the first client doesn't pay
-    // the ~1s firmware roundtrip. Non-fatal — falls back to lazy generation.
-    if !config.mock_tee {
+    // the ~1s firmware roundtrip. Mock mode skips this — its payload is a
+    // ~zero-cost placeholder anyway and we'd rather see the per-handshake
+    // WARN every time it's served, not silently cached.
+    if tee_mode == TeeMode::Real {
         let t0 = std::time::Instant::now();
-        match tee::generate_attestation(static_keypair.public_key(), false).await {
+        match tee::generate_attestation(static_keypair.public_key(), tee_mode).await {
             Ok(ref payload) => {
                 let elapsed = t0.elapsed();
                 info!("attestation cached in {:.0?}", elapsed);
@@ -100,7 +102,7 @@ pub async fn start_server(config: Config) -> anyhow::Result<()> {
                     let keypair = Arc::clone(&keypair_c);
                     let client = Arc::clone(&client_c);
                     let sem = Arc::clone(&sem_c);
-                    async move { handle_request(req, config, keypair, client, sem).await }
+                    async move { handle_request(req, config, keypair, client, sem, tee_mode).await }
                 }),
             );
 
@@ -117,6 +119,7 @@ async fn handle_request(
     keypair: Arc<StaticKeypair>,
     http_client: Arc<reqwest::Client>,
     handshake_semaphore: Arc<Semaphore>,
+    tee_mode: TeeMode,
 ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
     // Health endpoint
     if req.uri().path() == "/health" {
@@ -142,7 +145,7 @@ async fn handle_request(
             }
         };
 
-        if let Err(e) = handle_websocket(websocket, config, keypair, http_client).await {
+        if let Err(e) = handle_websocket(websocket, config, keypair, http_client, tee_mode).await {
             warn!(error = %e, "websocket handler error");
         }
     });
@@ -155,6 +158,7 @@ async fn handle_websocket(
     config: Arc<Config>,
     keypair: Arc<StaticKeypair>,
     http_client: Arc<reqwest::Client>,
+    tee_mode: TeeMode,
 ) -> anyhow::Result<()> {
     let ws = websocket.await?;
     let (mut ws_sink, mut ws_stream) = ws.split();
@@ -182,8 +186,10 @@ async fn handle_websocket(
     let msg0: Vec<u8> = recv_binary!(ws_stream)?;
     responder.read_msg0(&msg0)?;
 
-    // Generate attestation
-    let attestation = tee::generate_attestation(keypair.public_key(), config.mock_tee).await?;
+    // Generate attestation. In mock mode this returns instantly with a
+    // placeholder payload; the WARN inside generate_attestation already
+    // fires per-handshake.
+    let attestation = tee::generate_attestation(keypair.public_key(), tee_mode).await?;
     let attestation_json = serde_json::to_vec(&attestation)?;
 
     // msg 1: send ephemeral + static + attestation
@@ -214,6 +220,13 @@ async fn handle_websocket(
             Ok(data) => data,
             Err(_) => break,
         };
+
+        // Loud per-message warning in mock mode — the user-chosen audit trail.
+        // Volume is intentional: every recv on a non-attested connection is one
+        // log line so an operator skimming logs can't miss it.
+        if tee_mode == TeeMode::Mock {
+            warn!("kawa: received message on MOCK connection (no TEE attestation backing this transport)");
+        }
 
         // Decrypt
         let plain_frame = transport.decrypt(&raw)?;
@@ -480,7 +493,7 @@ where
 
 // ── Boot banner helpers ──────────────────────────────────────────
 
-fn log_system_info(config: &Config) {
+fn log_system_info(config: &Config, tee_mode: TeeMode) {
     // Kernel
     let kernel = std::fs::read_to_string("/proc/version")
         .ok()
@@ -504,7 +517,7 @@ fn log_system_info(config: &Config) {
     info!("kawa v{}", env!("CARGO_PKG_VERSION"));
     info!("kernel={kernel} vcpus={cpus} memory={mem}");
     info!(
-        "mode={} pq={} port={}",
+        "mode={} pq={} port={} attestation={}",
         if config.is_standalone() {
             "standalone"
         } else {
@@ -512,6 +525,10 @@ fn log_system_info(config: &Config) {
         },
         config.enable_pq,
         config.port,
+        match tee_mode {
+            TeeMode::Real => "real",
+            TeeMode::Mock => "MOCK",
+        },
     );
 }
 

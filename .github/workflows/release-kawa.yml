@@ -3,10 +3,6 @@ name: Release kawa
 on:
   push:
     tags: ['kawa-v*']
-  # Lets us re-run for an existing tag (e.g. to backfill the mocktee
-  # artifact onto a release that was cut before this workflow learned
-  # about it). The build + upload steps use `--clobber`, so re-runs are
-  # safe — they replace whatever was there.
   workflow_dispatch:
     inputs:
       tag:
@@ -47,34 +43,18 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      # ── Production build (TEE attestation required at runtime) ────
-      - name: Build production kawa
+      # Single-binary build: kawa runtime-detects whether configfs-tsm offers
+      # a usable TSM provider at startup. Real TEE → signed quotes; non-TEE →
+      # loud per-message mock-attestation warnings (and konnect's default
+      # KattValidator rejects platform=="mock").
+      - name: Build kawa
         run: cargo build --release --target x86_64-unknown-linux-musl
         working-directory: kawa
 
-      - name: Package production kawa
+      - name: Package kawa
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
           ARCHIVE="kawa-${TAG#kawa-}-linux-x86_64.tar.gz"
-          cp kawa/target/x86_64-unknown-linux-musl/release/kawa kawa-bin
-          tar czf "$ARCHIVE" -C . kawa-bin LICENSE
-          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-          rm kawa-bin
-
-      # ── Mock-TEE build (dev/test only, never deploy in a CVM) ─────
-      # Same source, same tag, second build with `--features mock`.
-      # The mock variant is gated at compile time (#[cfg(feature = "mock")])
-      # so production builds cannot be coerced into mock mode by any
-      # runtime flag. This artifact exists for laptop/CI testing of the
-      # full Noise + X-Wing handshake without TEE hardware.
-      - name: Build mock-TEE kawa
-        run: cargo build --release --features mock --target x86_64-unknown-linux-musl
-        working-directory: kawa
-
-      - name: Package mock-TEE kawa
-        run: |
-          TAG="${{ steps.meta.outputs.tag }}"
-          ARCHIVE="kawa-mocktee-${TAG#kawa-}-linux-x86_64.tar.gz"
           cp kawa/target/x86_64-unknown-linux-musl/release/kawa kawa-bin
           tar czf "$ARCHIVE" -C . kawa-bin LICENSE
           sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
@@ -86,21 +66,15 @@ jobs:
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
           PROD="kawa-${TAG#kawa-}-linux-x86_64.tar.gz"
-          MOCK="kawa-mocktee-${TAG#kawa-}-linux-x86_64.tar.gz"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG exists — uploading with --clobber"
-            gh release upload "$TAG" --clobber \
-              "$PROD" "$PROD.sha256" \
-              "$MOCK" "$MOCK.sha256"
+            gh release upload "$TAG" --clobber "$PROD" "$PROD.sha256"
           else
             gh release create "$TAG" \
               --title "$TAG" \
-              --notes "Production binary: \`kawa-${TAG#kawa-}-linux-x86_64.tar.gz\`
-              Used by cvmbuild as the kawa pinned version. Reads attestation from /sys/kernel/config/tsm/report — only works inside a real SEV-SNP / TDX guest.
+              --notes "Single-binary kawa for x86_64-linux-musl.
 
-              Mock-TEE binary: \`kawa-mocktee-${TAG#kawa-}-linux-x86_64.tar.gz\`
-              **Dev/test only — never deploy in a CVM image.** Returns deterministic fake attestation reports so the full Noise + X-Wing handshake can be exercised on a laptop or in CI without TEE hardware. Konnect must be configured to accept the mock report (skip-attestation or mock-mode validator) for the handshake to complete." \
-              "$PROD" "$PROD.sha256" \
-              "$MOCK" "$MOCK.sha256"
+              Runtime-detects TEE: opens \`/sys/kernel/config/tsm/report\` at startup. If a usable TSM provider answers, real SEV-SNP / TDX attestation is served; otherwise kawa runs in mock mode and serves a clearly-marked \`platform: \"mock\"\` payload. Konnect's default KattValidator rejects mock payloads — production deployments stay safe regardless. Mock mode emits a loud WARN at startup, on every served handshake, and on every message in the transport loop." \
+              "$PROD" "$PROD.sha256"
           fi
