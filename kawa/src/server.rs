@@ -126,6 +126,19 @@ async fn handle_request(
         return Ok(Response::new(Full::new("ok".into())));
     }
 
+    // Mode endpoint — teehost probes this to surface "real" vs "mock" in the
+    // VM list. Self-reported by kawa; fine for operator UI (konnect remains
+    // the trust anchor for clients via the signed attestation envelope).
+    if req.uri().path() == "/mode" {
+        let body = match tee_mode {
+            TeeMode::Real => "{\"mode\":\"real\"}",
+            TeeMode::Mock => "{\"mode\":\"mock\"}",
+        };
+        return Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(body.into()))?);
+    }
+
     // Check for WebSocket upgrade
     if !hyper_tungstenite::is_upgrade_request(&req) {
         return Ok(Response::builder()

@@ -42,7 +42,9 @@ pub async fn detect_tee_mode(force_mock: bool) -> TeeMode {
     match tokio::fs::create_dir(&probe).await {
         Ok(()) => {
             let _ = tokio::fs::remove_dir(&probe).await;
-            info!("TEE backing OK ({TSM_REPORT_BASE} accepts report entries) — REAL attestation mode");
+            info!(
+                "TEE backing OK ({TSM_REPORT_BASE} accepts report entries) — REAL attestation mode"
+            );
             TeeMode::Real
         }
         Err(e) => {
