@@ -16,6 +16,7 @@ id = "qwen3-0.6b-q4-llamacpp-cpu-mock"
 version = "0.1.0"
 base = "Dockerfile"
 context = "../.."
+ovmf_version = "0.1.0"
 # kawa-mocktee instead of production kawa: build-time selection forwarded
 # to cvm-base via the standard ARG KAWA_VARIANT.
 build_args = { KAWA_VARIANT = "kawa-mocktee" }

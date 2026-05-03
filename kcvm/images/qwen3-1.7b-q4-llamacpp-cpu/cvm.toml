@@ -6,6 +6,7 @@ id = "qwen3-1.7b-q4-llamacpp-cpu"
 version = "0.1.0"
 base = "Dockerfile"
 context = "../.."
+ovmf_version = "0.1.0"
 
 [kernel]
 cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd"
