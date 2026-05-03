@@ -12,7 +12,7 @@ use hyper_tungstenite::HyperWebsocket;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Max concurrent WebSocket handshakes (Noise + attestation).
 /// Prevents resource exhaustion from connection floods.
@@ -107,7 +107,18 @@ pub async fn start_server(config: Config, tee_mode: TeeMode) -> anyhow::Result<(
             );
 
             if let Err(e) = conn.with_upgrades().await {
-                warn!(error = %e, "connection error");
+                // teehost's per-poll probes against /health and /mode end with
+                // a clean client-side close that hyper still surfaces as
+                // "connection closed before message completed". Demote that
+                // benign case so it doesn't drown the operator's log; real
+                // truncated requests / half-WebSocket-handshakes have other
+                // strings and stay loud.
+                let msg = e.to_string();
+                if msg.contains("connection closed before message completed") {
+                    debug!(error = %e, "connection error (benign close)");
+                } else {
+                    warn!(error = %e, "connection error");
+                }
             }
         });
     }
@@ -123,7 +134,9 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
     // Health endpoint
     if req.uri().path() == "/health" {
-        return Ok(Response::new(Full::new("ok".into())));
+        return Ok(Response::builder()
+            .header("connection", "close")
+            .body(Full::new("ok".into()))?);
     }
 
     // Mode endpoint — teehost probes this to surface "real" vs "mock" in the
@@ -136,6 +149,7 @@ async fn handle_request(
         };
         return Ok(Response::builder()
             .header("content-type", "application/json")
+            .header("connection", "close")
             .body(Full::new(body.into()))?);
     }
 
