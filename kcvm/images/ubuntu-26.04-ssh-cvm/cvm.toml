@@ -59,12 +59,14 @@ outbound = "deny"
 
 # teehost reads [network] to decide:
 #   1. Which CVM-side port to wire its hostfwd to (host:<host_port> → :22)
-#   2. How to liveness-probe the VM. "tcp" just connects to expose_port —
-#      no kawa-specific HTTP probe, no /health, no /mode. The UI shows a
-#      generic "ready/waiting" dot instead of the kawa attestation pill.
+#   2. How to liveness-probe the VM. "none" skips network probing entirely
+#      (the real "is the VM up?" signal is the QEMU process state, which
+#      teehost already tracks via vm.state). A TCP probe here would
+#      connect-and-close on sshd every few seconds, filling the boot log
+#      with `sshd: Connection closed by 10.0.2.2 ...` for no benefit.
 [network]
 expose_port = 22
-probe = "tcp"
+probe = "none"
 
 [services]
 
