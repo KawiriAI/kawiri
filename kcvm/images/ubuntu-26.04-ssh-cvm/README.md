@@ -129,13 +129,47 @@ image identity, not a shared recipe.
   declare `[network]` keep working unchanged via the back-compat default
   (kawa on 8443).
 
+## Docker (since v0.3.0)
+
+The image ships `docker.io` from Ubuntu's archive, plus the supporting
+kernel modules (`overlay`, `bridge`, `br_netfilter`, `veth`, `nf_nat`,
+`iptable_nat`, `ipt_MASQUERADE`, `ip_tables`, `xt_addrtype`,
+`xt_conntrack`) loaded from initrd so they're available before
+`lock_modules` seals modprobe. `/var/lib/docker` is a tmpfs (kernel
+default size, ~50% of VM RAM), so:
+
+- containers and images live in memory and are wiped on every boot
+- `docker pull` from the public internet is **blocked** by cvmbuild's
+  `outbound = "deny"` nftables policy (the platform's zero-trust check
+  rejects `outbound = "allow"`). The supported workflows are:
+  - **`docker load`** from a tarball SCP'd in over the SSH session:
+    `docker save myimg | ssh -p 18443 root@host docker load`
+  - **`docker build`** with a base image already loaded into
+    `/var/lib/docker` (no `FROM` external)
+  - **flush the firewall yourself**: you're root in the VM, so
+    `nft flush ruleset` followed by Docker's own iptables setup
+    will let `docker pull` reach the registry. This relaxes the
+    cvmbuild-applied policy *for this boot only*; reboot restores it.
+
+Forks that want persistent Docker state (images survive reboot) should
+replace the `[[services.mounts]]` for `/var/lib/docker` with a
+`[[verity_disks]]`-backed writable LV — same pattern the inference
+images use for `/mnt/models`.
+
+The `docker` group is created by the package post-install (and
+defensively in the Dockerfile). Root in the VM is implicitly able to
+talk to `/var/run/docker.sock`; on a fork that adds a non-root user,
+`usermod -aG docker <name>` gives them Docker access.
+
 ## Files
 
 - `cvm.toml` — image config; sshd-keygen + sshd systemd units, manifest
-  declarations, assert excludes.
+  declarations, assert excludes, `/var/lib/docker` tmpfs mount,
+  Docker-required initrd modules.
 - `Dockerfile` — `FROM cvm-base:latest`; installs openssh-server +
-  vim-tiny + less + iputils-ping; bakes `/etc/passwd.sshd` and the
-  overlay tree.
+  vim-tiny + less + iputils-ping + docker.io; bakes `/etc/passwd.sshd`
+  and the overlay tree; enables `docker.socket` / `docker.service` /
+  `containerd.service`.
 - `overlay/root/.ssh/authorized_keys` — kawiri-test pubkey.
 - `overlay/usr/local/sbin/sshd-keygen` — boot-time host-key generator
   (writes to `/run/sshd-keys` tmpfs).

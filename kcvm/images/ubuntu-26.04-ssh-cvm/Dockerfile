@@ -14,17 +14,46 @@ SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Re-populate apt lists (cvm-base wipes /var/lib/apt/lists/*) and install
-# the SSH server. vim-tiny + less + iputils-ping for basic interactive
-# usability — without them an SSH'd-in operator is squinting at `cat` and
-# would have no way to debug network issues.
+# the SSH server, basic interactive tooling, and Docker.
+#
+# docker.io is Ubuntu's stock Docker package — pulls in containerd, runc,
+# iptables, bridge-utils, and (importantly for us) creates the `docker`
+# group via the package post-install. Operators logging in as root are
+# implicitly able to talk to /var/run/docker.sock; on a fork that adds a
+# non-root user, that user gets Docker access by `usermod -aG docker <name>`.
+#
+# Caveats this image inherits from the cvmbuild platform:
+#   - `outbound = "deny"` (cvmbuild rejects any other value at validate
+#     time as a zero-trust violation), so `docker pull` from the public
+#     internet won't work out of the box. Operators wanting external pulls
+#     either bake images at build time (additional layers below this point),
+#     `docker load` from a tarball SCP'd in over SSH, or — since they're
+#     root in the VM — `nft flush ruleset` to relax the policy. See README.
+#   - `lock_modules = true` + lockdown=confidentiality means Docker can't
+#     modprobe at runtime; the kernel modules it needs are loaded via
+#     [kernel].initrd_modules in cvm.toml.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssh-server \
         vim-tiny \
         less \
         iputils-ping \
+        docker.io \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+# `apt install docker.io` does create the `docker` group via post-install,
+# but only when Debian's adduser scripts run cleanly under buildkit. The
+# explicit `groupadd -r` is the defensive belt-and-suspenders so a fork
+# can `usermod -aG docker <newuser>` without surprise.
+RUN groupadd -r -f docker
+
+# Enable Docker's units the standard apt-shipped way: dpkg dropped the
+# unit files into /lib/systemd/system; we just create the multi-user
+# wants symlinks so systemd starts them at boot. (Inside Docker build
+# context `systemctl enable` is a pure filesystem op — it just makes
+# the symlinks — so this works without a running systemd.)
+RUN systemctl enable docker.socket docker.service containerd.service
 
 # Disable Ubuntu's stock ssh socket activation — we run sshd directly via
 # our own systemd unit (declared in cvm.toml [services.units]) so the host
