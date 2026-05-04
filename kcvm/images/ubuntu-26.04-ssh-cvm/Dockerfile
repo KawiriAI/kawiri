@@ -1,9 +1,9 @@
 # ubuntu-26.04-ssh-cvm — confidential VM with direct SSH
 #
-# This is NOT an inference image and doesn't run kawa. sshd binds 0.0.0.0:8443
-# (matching teehost's hostfwd convention so no teehost change is needed) and
-# operators connect with stock SSH. Attestation is verified post-login by the
-# operator reading /sys/kernel/config/tsm/report directly inside the CVM.
+# This is NOT an inference image and doesn't run kawa. sshd binds 0.0.0.0:22
+# (declared in cvm.toml [network].expose_port) and operators connect with
+# stock SSH. Attestation is verified post-login by the operator reading
+# /sys/kernel/config/tsm/report directly inside the CVM.
 #
 # Requires cvm-base:latest (kernel, dracut, systemd, dm-verity stack — the
 # kawa binary it ships is unused here, dead weight that costs ~5 MB).
@@ -74,9 +74,10 @@ RUN sed 's,^root:x:0:0:root:/root:/usr/sbin/nologin$,root:x:0:0:root:/root:/bin/
 
 # Bake the overlay tree directly into the rootfs via Docker COPY rather
 # than cvmbuild's [overlay.files] mechanism — cvmbuild resolves overlay
-# src paths relative to its CWD (teehost's working dir), so the explicit
-# Docker COPY from the build context is the bulletproof option. The
-# build context is the kcvm/ repo root (cvm.toml's `context = "../..").
+# src paths relative to its CWD (the host management plane's working
+# dir), so the explicit Docker COPY from the build context is the
+# bulletproof option. The build context is the kcvm/ repo root
+# (cvm.toml's `context = "../..").
 COPY images/ubuntu-26.04-ssh-cvm/overlay/root/.ssh/authorized_keys /root/.ssh/authorized_keys
 COPY images/ubuntu-26.04-ssh-cvm/overlay/usr/local/sbin/sshd-keygen /usr/local/sbin/sshd-keygen
 

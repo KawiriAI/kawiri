@@ -1,16 +1,15 @@
 # ubuntu-26.04-ssh-cvm — confidential VM with direct SSH
 #
-# A CVM that exposes sshd directly on the port teehost forwards (kawa's
-# default 8443, so no teehost change is needed). Operators connect
-# straight with stock SSH — no kawa, no konnect-proxy, no tunnel mode.
+# A CVM that exposes sshd directly on port 22 (declared in
+# [network].expose_port below). Operators connect with stock SSH — no
+# kawa, no konnect-proxy, no tunnel mode. The host management plane
+# wires its per-VM port forward to this guest port.
 #
-# Workflow:
-#   curl -X POST http://localhost:8800/api/v1/vms \
-#        -d '{"image_dir":"…/ubuntu-26.04-ssh-cvm","tee":"snp",…}'
-#   → {"id":"vm-…","host_port":18443,…}
-#   ssh -i kawiri-test -o StrictHostKeyChecking=no \
-#       -o UserKnownHostsFile=/dev/null \
-#       -p 18443 root@<vm-host>
+# Workflow (host management plane provides the boot/forwarding):
+#   1. Boot the VM with this image and get back a host port.
+#   2. ssh -i kawiri-test -o StrictHostKeyChecking=no \
+#          -o UserKnownHostsFile=/dev/null \
+#          -p <host_port> root@<vm-host>
 #
 # Attestation is verified post-login by reading /sys/kernel/config/tsm/report
 # directly inside the CVM (see README) — there is no client-side attestation
@@ -43,9 +42,11 @@ cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confiden
 #     ip_tables, xt_addrtype,
 #     xt_conntrack          container egress NAT + the matchers Docker installs
 #   - ipt_MASQUERADE       SNAT for container egress
+#   - dm-crypt             LUKS support for the operator's writable data
+#                          disk (see "Persistent encrypted storage" in README)
 # lock_modules=true seals modprobe after init, so all of these have to be
-# loaded from the initrd. If a module is built-in to matcha's kernel the
-# kmod entry is just a no-op.
+# loaded from the initrd. Modules built into the host kernel are no-ops in
+# this list.
 initrd_modules = [
   "dm-verity", "dm-mod", "dm-bufio", "squashfs",
   "virtio-blk", "virtio-pci", "virtio-net", "virtio-scsi",
@@ -54,9 +55,6 @@ initrd_modules = [
   "bridge", "br_netfilter", "veth",
   "nf_nat", "iptable_nat", "ip_tables", "ipt_MASQUERADE",
   "xt_addrtype", "xt_conntrack",
-  # dm-crypt for the operator-managed LUKS data disk attached by
-  # teehost via BootRequest.data_disk_gb. lock_modules=true seals
-  # modprobe after init, so dm-crypt has to come from initrd.
   "dm-crypt",
 ]
 
@@ -73,20 +71,20 @@ remove = ["apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "d
 remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"]
 lock_modules = true
 
-# sshd is the only inbound listener; teehost's per-VM hostfwd targets
-# CVM:22 (declared in [network] below) so this image looks like normal
-# SSH from outside.
+# sshd is the only inbound listener; the host management plane wires
+# its per-VM port forward to CVM:22 (declared in [network] below) so
+# this image looks like normal SSH from outside.
 [firewall]
 inbound = [{ port = 22, proto = "tcp" }]
 outbound = "deny"
 
-# teehost reads [network] to decide:
-#   1. Which CVM-side port to wire its hostfwd to (host:<host_port> → :22)
-#   2. How to liveness-probe the VM. "none" skips network probing entirely
-#      (the real "is the VM up?" signal is the QEMU process state, which
-#      teehost already tracks via vm.state). A TCP probe here would
-#      connect-and-close on sshd every few seconds, filling the boot log
-#      with `sshd: Connection closed by 10.0.2.2 ...` for no benefit.
+# [network] tells the host management plane:
+#   1. Which CVM-side port to forward inbound traffic to (here: 22).
+#   2. How to liveness-probe the VM. "none" skips network probing
+#      entirely (the real "is the VM up?" signal is the QEMU process
+#      state). A TCP probe here would connect-and-close on sshd every
+#      few seconds, filling the boot log with `sshd: Connection closed
+#      by 10.0.2.2 ...` for no benefit.
 [network]
 expose_port = 22
 probe = "none"
@@ -137,9 +135,9 @@ extra_options = [
 ]
 
 # sshd unit notes:
-# - Listens on 0.0.0.0:22 — teehost's hostfwd is now per-image
-#   ([network].expose_port above), so no need to ride the legacy 8443
-#   convention. Operators just `ssh -p <host_port> root@host`.
+# - Listens on 0.0.0.0:22 — the per-image [network].expose_port above
+#   tells the host management plane where to point its forward, so
+#   operators just `ssh -p <host_port> root@host`.
 # - All sshd_config knobs passed via -o flags so we don't depend on
 #   /etc/ssh/sshd_config.d/*.conf Include behaviour. Visible in `ps`,
 #   bulletproof for debugging.

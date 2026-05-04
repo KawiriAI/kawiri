@@ -1,38 +1,31 @@
 # ubuntu-26.04-ssh-cvm
 
-A confidential VM with direct SSH. The CVM exposes one TCP port (sshd on
-22 — declared via `[network].expose_port` in cvm.toml so teehost's
-hostfwd targets it directly). Operators connect with any standard SSH
-client and verify the launch measurement post-login by reading
-`/sys/kernel/config/tsm/report` inside the CVM.
+A confidential VM with direct SSH. The CVM exposes one TCP port —
+sshd on 22, declared via `[network].expose_port` in cvm.toml. The
+host management plane forwards an external port to it; operators
+connect with any standard SSH client and verify the launch
+measurement post-login by reading `/sys/kernel/config/tsm/report`
+inside the CVM.
 
 ```
-operator                    teehost host                  CVM
-┌────────┐  ssh -p 18443  ┌──────────────┐  qemu hostfwd  ┌──────────────┐
-│ ssh    │ ─────────────▶ │ :18443 → :22 │ ─────────────▶ │ sshd  :22    │
-│        │ ◀───────────── │              │ ◀───────────── │              │
-└────────┘                └──────────────┘                │ /bin/bash    │
-                                                          │ verity / RO  │
-                                                          └──────────────┘
+operator                    host                       CVM
+┌────────┐  ssh -p host  ┌─────────────────────┐   ┌──────────────┐
+│ ssh    │ ────────────▶ │ port forward → :22  │ ▶ │ sshd  :22    │
+│        │ ◀──────────── │                     │ ◀ │              │
+└────────┘                └─────────────────────┘   │ /bin/bash    │
+                                                    │ verity / RO  │
+                                                    └──────────────┘
 ```
 
 ## Quick start
 
+The host management plane is responsible for booting the VM and
+forwarding a host port to guest port 22. Once it tells you the port:
+
 ```bash
-# 1. Boot the VM via teehost (mock TEE on a non-TEE dev box; "snp"/"tdx" otherwise)
-curl -fsS -X POST http://localhost:8800/api/v1/vms \
-    -H 'content-type: application/json' \
-    -d '{"image_dir":"/var/lib/kawiri/kcvm/images/ubuntu-26.04-ssh-cvm",
-         "tee":"none","mem":"2G","cpus":2}'
-# → {"id":"vm-...","host_port":18443,...}
-
-# 2. Wait for the VM to come up (state == "running"). sshd-keygen.service
-#    writes a fresh ed25519 host key into /run/sshd-keys, then sshd starts.
-
-# 3. SSH in with the test key
 ssh -i kawiri/kcvm/test-fixtures/ssh-keys/kawiri-test \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -p 18443 root@<vm-host>
+    -p <host_port> root@<vm-host>
 ```
 
 The `StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` options are
@@ -82,8 +75,8 @@ image identity, not a shared recipe.
 1. Generate your own keypair: `ssh-keygen -t ed25519 -f my-cvm -C "my-cvm-prod"`.
 2. Replace the line in `overlay/root/.ssh/authorized_keys` with the contents
    of `my-cvm.pub`.
-3. Rebuild via the teehost UI / API. The new `manifest.json` will have
-   different measurements; pin them in `manifest.expected.json`.
+3. Rebuild the image. The new `manifest.json` will have different
+   measurements; pin them in `manifest.expected.json`.
 4. Distribute `manifest.expected.json` (or just the launch digest) to the
    humans who will SSH in. They run the verification snippet above and
    confirm match.
@@ -120,32 +113,31 @@ image identity, not a shared recipe.
   image's whole point is to give a shell, so we exclude those checks.
   apt/dpkg/pip/dmsetup are still stripped — verity rootfs makes
   apt-install a no-op anyway.
-- **sshd on port 22 (and `[network]` block in cvm.toml)**: teehost reads
-  `[network].expose_port` from each image's cvm.toml and uses it as the
-  guest-side hostfwd target, so this image gets a normal SSH port
-  inside. The `probe = "tcp"` field tells teehost to liveness-check by
-  connecting to the port instead of running the kawa /health probe (which
-  would hang since there's no kawa here). Inference images that don't
-  declare `[network]` keep working unchanged via the back-compat default
-  (kawa on 8443).
+- **sshd on port 22 (and `[network]` block in cvm.toml)**: the host
+  management plane reads `[network].expose_port` from each image's
+  cvm.toml and uses it as the guest-side forward target, so this image
+  gets a normal SSH port inside. The `probe = "none"` field tells the
+  management plane to skip network probing (sshd will accept and
+  immediately close TCP probes, which would just spam the boot log).
+  Inference images that don't declare `[network]` keep working
+  unchanged via the back-compat default (kawa on 8443).
 
 ## Persistent encrypted storage (since v0.4.0)
 
-teehost can attach an operator-managed writable qcow2 to the VM at boot
-time (boot wizard's "Data disk (GB)" field, or `data_disk_gb` in the
-boot request). The image bundles `cryptsetup` and the `dm-crypt`
-kernel module so the operator can LUKS-format the disk post-login with
-**their own passphrase** — teehost never sees the plaintext, the host
-never has the key.
+The host management plane can attach an operator-managed writable
+qcow2 to the VM at boot time. The image bundles `cryptsetup` and the
+`dm-crypt` kernel module so the operator can LUKS-format the disk
+post-login with **their own passphrase** — the host never sees the
+plaintext, the host never has the key.
 
-Inside the VM the disk shows up as
-`/dev/disk/by-id/virtio-teehost-data` (a stable symlink that survives
-re-enumeration when other images change verity-disk counts). First-time
-setup:
+When attached, the disk shows up inside the VM as
+`/dev/disk/by-id/virtio-kawiri-data` (a stable symlink that survives
+re-enumeration when other images change verity-disk counts).
+First-time setup:
 
 ```bash
-cryptsetup luksFormat /dev/disk/by-id/virtio-teehost-data
-cryptsetup luksOpen /dev/disk/by-id/virtio-teehost-data data
+cryptsetup luksFormat /dev/disk/by-id/virtio-kawiri-data
+cryptsetup luksOpen /dev/disk/by-id/virtio-kawiri-data data
 mkfs.ext4 /dev/mapper/data
 mount /dev/mapper/data /var/lib/docker
 systemctl restart docker
@@ -154,13 +146,13 @@ systemctl restart docker
 On every subsequent boot:
 
 ```bash
-cryptsetup luksOpen /dev/disk/by-id/virtio-teehost-data data
+cryptsetup luksOpen /dev/disk/by-id/virtio-kawiri-data data
 mount /dev/mapper/data /var/lib/docker
 systemctl restart docker
 ```
 
-The qcow2 file persists across kill/restart. Explicit purge from the
-VM detail page in the teehost UI when stopped.
+The qcow2 file persists across kill/restart. The host management
+plane is responsible for purging it when no longer needed.
 
 Security model:
 - Host operator sees the qcow2 file (it's on host disk) but only as
