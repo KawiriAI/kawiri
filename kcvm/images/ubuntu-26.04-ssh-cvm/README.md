@@ -131,13 +131,13 @@ post-login with **their own passphrase** — the host never sees the
 plaintext, the host never has the key.
 
 When attached, the disk shows up inside the VM as
-`/dev/disk/by-id/virtio-kawiri-data` (a stable symlink that survives
+`/dev/disk/by-id/virtio-cvm-data` (a stable symlink that survives
 re-enumeration when other images change verity-disk counts).
 First-time setup:
 
 ```bash
-cryptsetup luksFormat /dev/disk/by-id/virtio-kawiri-data
-cryptsetup luksOpen /dev/disk/by-id/virtio-kawiri-data data
+cryptsetup luksFormat /dev/disk/by-id/virtio-cvm-data
+cryptsetup luksOpen /dev/disk/by-id/virtio-cvm-data data
 mkfs.ext4 /dev/mapper/data
 mount /dev/mapper/data /var/lib/docker
 systemctl restart docker
@@ -146,7 +146,7 @@ systemctl restart docker
 On every subsequent boot:
 
 ```bash
-cryptsetup luksOpen /dev/disk/by-id/virtio-kawiri-data data
+cryptsetup luksOpen /dev/disk/by-id/virtio-cvm-data data
 mount /dev/mapper/data /var/lib/docker
 systemctl restart docker
 ```
