@@ -39,6 +39,7 @@ RUN apt-get update && \
         less \
         iputils-ping \
         docker.io \
+        cryptsetup \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 

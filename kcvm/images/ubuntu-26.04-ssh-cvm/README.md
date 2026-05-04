@@ -129,6 +129,54 @@ image identity, not a shared recipe.
   declare `[network]` keep working unchanged via the back-compat default
   (kawa on 8443).
 
+## Persistent encrypted storage (since v0.4.0)
+
+teehost can attach an operator-managed writable qcow2 to the VM at boot
+time (boot wizard's "Data disk (GB)" field, or `data_disk_gb` in the
+boot request). The image bundles `cryptsetup` and the `dm-crypt`
+kernel module so the operator can LUKS-format the disk post-login with
+**their own passphrase** — teehost never sees the plaintext, the host
+never has the key.
+
+Inside the VM the disk shows up as
+`/dev/disk/by-id/virtio-teehost-data` (a stable symlink that survives
+re-enumeration when other images change verity-disk counts). First-time
+setup:
+
+```bash
+cryptsetup luksFormat /dev/disk/by-id/virtio-teehost-data
+cryptsetup luksOpen /dev/disk/by-id/virtio-teehost-data data
+mkfs.ext4 /dev/mapper/data
+mount /dev/mapper/data /var/lib/docker
+systemctl restart docker
+```
+
+On every subsequent boot:
+
+```bash
+cryptsetup luksOpen /dev/disk/by-id/virtio-teehost-data data
+mount /dev/mapper/data /var/lib/docker
+systemctl restart docker
+```
+
+The qcow2 file persists across kill/restart. Explicit purge from the
+VM detail page in the teehost UI when stopped.
+
+Security model:
+- Host operator sees the qcow2 file (it's on host disk) but only as
+  ciphertext after `luksFormat` — LUKS does its job.
+- Passphrase lives in the operator's head; entered over SSH which is
+  itself running inside the TEE-encrypted VM memory, so the host
+  never sees it on the wire either.
+- This trades the (planned) attested-key-delivery automation for
+  human-types-passphrase-every-boot. Right call for an SSH-CVM dev
+  box; wrong call for an unattended fleet.
+
+Adding the disk does **not** change the launch measurement — the
+SNP `LAUNCH_DIGEST` covers OVMF + kernel + initrd + cmdline + VMSA +
+CPUID, not device topology. Same `manifest.expected.json` whether
+the VM was booted with 0, 1, or N data disks.
+
 ## Docker (since v0.3.0)
 
 The image ships `docker.io` from Ubuntu's archive, plus the supporting

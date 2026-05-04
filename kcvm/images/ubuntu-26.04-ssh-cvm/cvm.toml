@@ -28,7 +28,7 @@
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.3.0"
+version = "0.4.0"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
@@ -54,6 +54,10 @@ initrd_modules = [
   "bridge", "br_netfilter", "veth",
   "nf_nat", "iptable_nat", "ip_tables", "ipt_MASQUERADE",
   "xt_addrtype", "xt_conntrack",
+  # dm-crypt for the operator-managed LUKS data disk attached by
+  # teehost via BootRequest.data_disk_gb. lock_modules=true seals
+  # modprobe after init, so dm-crypt has to come from initrd.
+  "dm-crypt",
 ]
 
 [verity]
