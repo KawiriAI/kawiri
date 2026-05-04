@@ -80,14 +80,12 @@ RUN sed 's,^root:x:0:0:root:/root:/usr/sbin/nologin$,root:x:0:0:root:/root:/bin/
 # (cvm.toml's `context = "../..").
 COPY images/ubuntu-26.04-ssh-cvm/overlay/root/.ssh/authorized_keys /root/.ssh/authorized_keys
 COPY images/ubuntu-26.04-ssh-cvm/overlay/usr/local/sbin/sshd-keygen /usr/local/sbin/sshd-keygen
-COPY images/ubuntu-26.04-ssh-cvm/overlay/usr/local/sbin/firewall-relax /usr/local/sbin/firewall-relax
 
 # Lock down perms (Docker COPY preserves source mode; redo here to be
 # explicit and resistant to host umask quirks).
 RUN chmod 700 /root/.ssh \
     && chmod 600 /root/.ssh/authorized_keys \
-    && chmod 755 /usr/local/sbin/sshd-keygen \
-    && chmod 755 /usr/local/sbin/firewall-relax
+    && chmod 755 /usr/local/sbin/sshd-keygen
 
 # /home is empty by design — anything written there is on the read-only
 # rootfs. Operators wanting persistent state should add a [[verity_disks]]

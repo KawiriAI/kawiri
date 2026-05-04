@@ -98,15 +98,17 @@ image identity, not a shared recipe.
 - Attestation verification is **post-login, by the operator**. There's no
   cryptographic gate before bytes flow — that's the trade for using
   standard SSH instead of a custom transport.
-- **Network posture is permissive (since v0.5.0)**. The image's
-  `firewall-relax.service` runs at boot and adds two accept rules on
-  top of cvmbuild's strict per-image ruleset:
-  - inbound ICMP echo (so anyone can `ping` the VM)
-  - outbound everything (so the VM can `apt update`, `git clone`,
-    `docker pull`, etc).
-  Inbound TCP is still locked to port 22 — only the SSH path is open.
-  Forks that want a hardened posture should drop the
-  `firewall-relax` unit from `[services.units]`.
+- **Network posture is permissive (since v0.5.1)**. Declared natively
+  in `cvm.toml`'s `[firewall]`:
+  - `inbound = [{ port = 22, proto = "tcp" }, { proto = "icmp" }]` —
+    SSH and ping; nothing else inbound.
+  - `outbound = "allow"` — the VM can `apt update`, `git clone`,
+    `docker pull`, etc. Requires excluding `firewall_outbound_deny`
+    from `[assert]` (a deliberate opt-in: the platform's default is
+    zero-trust deny).
+  Forks that want a hardened posture flip outbound back to "deny" and
+  remove the corresponding assert exclusion. Inference images keep
+  the strict default with no changes.
 
 ## Why some choices look weird
 

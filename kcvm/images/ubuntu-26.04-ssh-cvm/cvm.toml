@@ -27,7 +27,7 @@
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.5.0"
+version = "0.5.1"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
@@ -71,12 +71,22 @@ remove = ["apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "d
 remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"]
 lock_modules = true
 
-# sshd is the only inbound listener; the host management plane wires
-# its per-VM port forward to CVM:22 (declared in [network] below) so
-# this image looks like normal SSH from outside.
+# sshd is the only inbound TCP listener; the host management plane
+# wires its per-VM port forward to CVM:22. ICMP is open so anyone can
+# `ping` the VM (handy for liveness checks). Outbound is open ("allow")
+# so the operator can `apt update`, `git clone`, `docker pull` etc.
+# from inside.
+#
+# Outbound = "allow" requires excluding `firewall_outbound_deny` from
+# the production assert profile (see [assert].exclude below) — that's
+# the platform's intentional opt-in for "I am a developer-friendly
+# image and accept the responsibility."
 [firewall]
-inbound = [{ port = 22, proto = "tcp" }]
-outbound = "deny"
+inbound = [
+  { port = 22, proto = "tcp" },
+  { proto = "icmp" },
+]
+outbound = "allow"
 
 # [network] tells the host management plane:
 #   1. Which CVM-side port to forward inbound traffic to (here: 22).
@@ -114,32 +124,6 @@ what = "tmpfs"
 where = "/var/lib/docker"
 type = "tmpfs"
 description = "Docker storage root (ephemeral — overlay2 + container layers)"
-
-# Layer accept rules on top of cvmbuild's strict per-image firewall:
-# allow ICMP echo inbound (so external hosts can ping the VM) and
-# accept all outbound (so the VM can reach the internet for apt
-# updates, GitHub clones, Docker pulls, etc). cvmbuild's [firewall]
-# block can't express either — its schema is `inbound = [{port,proto}]`
-# (no ICMP, since ICMP has no port) and outbound is gated to
-# "deny" by the platform's zero-trust validate check. We work around
-# it by running a oneshot at boot that adds the allow rules to the
-# kernel's nftables ruleset directly.
-#
-# This is the right knob for the SSH-CVM specifically — it's a
-# developer-friendly box where the operator owns the VM and wants
-# normal connectivity. Inference images that need stricter posture
-# don't include this unit.
-[[services.units]]
-name = "firewall-relax"
-description = "Allow ICMP inbound + outbound any (SSH-CVM dev defaults)"
-exec = "/usr/local/sbin/firewall-relax"
-service_type = "oneshot"
-hardening = "minimal"
-after = ["nftables.service"]
-requires = ["nftables.service"]
-extra_options = [
-  "RemainAfterExit=yes",
-]
 
 # Generate a fresh ed25519 host key into /run/sshd-keys (tmpfs) at every
 # boot. Operators pass StrictHostKeyChecking=no since attestation is the
@@ -218,8 +202,15 @@ profile = "production"
 # firewall_no_ssh is excluded because SSH on port 22 IS the inbound surface
 # for this image. The assert is appropriate for chat-only CVMs that should
 # never expose 22; here it would block the entire image.
+#
+# firewall_outbound_deny is excluded because the SSH-CVM is a
+# developer-friendly box: the operator owns the VM and wants
+# `apt update`, `git clone`, `docker pull` to just work. Open egress
+# is the deliberate trade. Inference-image authors leave this assert
+# in place to keep their zero-trust posture.
 exclude = [
   "no_shells",
   "no_shells_extended",
   "firewall_no_ssh",
+  "firewall_outbound_deny",
 ]
