@@ -27,7 +27,7 @@
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.4.0"
+version = "0.5.0"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
@@ -114,6 +114,32 @@ what = "tmpfs"
 where = "/var/lib/docker"
 type = "tmpfs"
 description = "Docker storage root (ephemeral — overlay2 + container layers)"
+
+# Layer accept rules on top of cvmbuild's strict per-image firewall:
+# allow ICMP echo inbound (so external hosts can ping the VM) and
+# accept all outbound (so the VM can reach the internet for apt
+# updates, GitHub clones, Docker pulls, etc). cvmbuild's [firewall]
+# block can't express either — its schema is `inbound = [{port,proto}]`
+# (no ICMP, since ICMP has no port) and outbound is gated to
+# "deny" by the platform's zero-trust validate check. We work around
+# it by running a oneshot at boot that adds the allow rules to the
+# kernel's nftables ruleset directly.
+#
+# This is the right knob for the SSH-CVM specifically — it's a
+# developer-friendly box where the operator owns the VM and wants
+# normal connectivity. Inference images that need stricter posture
+# don't include this unit.
+[[services.units]]
+name = "firewall-relax"
+description = "Allow ICMP inbound + outbound any (SSH-CVM dev defaults)"
+exec = "/usr/local/sbin/firewall-relax"
+service_type = "oneshot"
+hardening = "minimal"
+after = ["nftables.service"]
+requires = ["nftables.service"]
+extra_options = [
+  "RemainAfterExit=yes",
+]
 
 # Generate a fresh ed25519 host key into /run/sshd-keys (tmpfs) at every
 # boot. Operators pass StrictHostKeyChecking=no since attestation is the
