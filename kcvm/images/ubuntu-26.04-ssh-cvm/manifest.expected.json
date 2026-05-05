@@ -1,23 +1,23 @@
 {
   "buildInputs": {
-    "rootfs_roothash": "0e05ac2ede2b81916e89af988230eba6869b52c3d6bea76d7a88cc7cd3c99ae0",
+    "rootfs_roothash": "b0b35caf771d345621e5fc7bcc1a384b62f6d3e3c7d91469ac0c375394d12237",
     "kernel_sha256": "6f11cd68fc0d181bb4f9a72e2d0ec6a1c2a69a59f7b9bd6bf9538630d1102456",
     "initrd_sha256": "cacf3031ce9b8dc4af38b5ffc699f58ed819d808e457248e6e685f2c9e2a21a8",
     "ovmf_sha256": "0e3e7879e4098efbccb41fea25d959e5cfff9a0526c4d61aaf2afb3560075de3",
-    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=0e05ac2ede2b81916e89af988230eba6869b52c3d6bea76d7a88cc7cd3c99ae0 console=ttyS0,115200n8"
+    "cmdline": "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd roothash=b0b35caf771d345621e5fc7bcc1a384b62f6d3e3c7d91469ac0c375394d12237 console=ttyS0,115200n8"
   },
   "measurements": {
     "snp": {
-      "SNP_EPYC-Genoa": "b64cdc4c2736b5b2800196bc0a7248c19b240bd042666d0ef7dc23bf0b6d1852b86503ffae273b9e3ed555452ad0201a",
-      "SNP_EPYC-Milan": "4e19afdaac6948b15dc79cf5e6bfdb4d397d17e1f7e21c73b41590fed67d13546b7b2884648699003135f417a2376e7a",
-      "SNP_EPYC-Rome": "54b52d7faf0f9fb712d8dfb4a850f6464e88d0daaf341fd486b74d2ed1f780988978fd5f6a253d4a108c365da148eba3",
-      "SNP_EPYC-v4": "788bc1cebeae5b843a992639e0f4d4935995915e263cc8599b81b08b64b0345e889ce38ee628e5ec40c7160d3f3b6e43"
+      "SNP_EPYC-Genoa": "fed7be6768830d71af20ed04381eba263556b9bed04be3059b4c980b55cabe1432fc1f4fc58735ad0b4350f3688c14cd",
+      "SNP_EPYC-Milan": "2e27fa544b92c20c5c7fb30b34d05558699162a728e7fe428ffbf86e1344fe667b218f0d509a9d58b6870fce99f483d3",
+      "SNP_EPYC-Rome": "1f251159d14e3fa142a11c16a598010f60188d629f9eed89687fb8419c48089d7f2f1ffa2edb13dacae1b5b44f48f07c",
+      "SNP_EPYC-v4": "4fc35c054373bc885e72fe75b09d65af45c93c561e828170395595d54d23ebf42bc665a2b492d2bd10ee6dfb58402267"
     },
     "tdx": {
       "MRTD": "5295fe8c30d9b8768f207d0148ce7853ef7b59b88710b287219245bae4f36903f20b0437d94e28d2de68e50bbcd1af8c",
       "RTMR0": "ba249794529d3fb6a718610b67890ce66dc4ba164d0d4c0b55a004ec27e2170cfa0d182469cb82ab8371fbe8c936026d",
       "RTMR1": "541a512471f33287889fef747dddd6a466c6ede39c6cdae9051295ba4bd8d2f6761a385775abb470eed5c8349f88e070",
-      "RTMR2": "316a887784d4e1f9cc09edb91c0da8daaab14d91a1a6d7d9369d8513acdc921217f038768e789c8126ee7667c0c84cbd",
+      "RTMR2": "75f209509c5fd3029752b9691a943c15fe046947899ac17a38343b4de3e898e597f1324d7500bf3a449db42effdfad2c",
       "RTMR3": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     }
   },
