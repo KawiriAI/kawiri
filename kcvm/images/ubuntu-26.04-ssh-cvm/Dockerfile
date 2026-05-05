@@ -80,32 +80,23 @@ RUN sed 's,^root:x:0:0:root:/root:/usr/sbin/nologin$,root:x:0:0:root:/root:/bin/
 # (cvm.toml's `context = "../..").
 COPY images/ubuntu-26.04-ssh-cvm/overlay/root/.ssh/authorized_keys /root/.ssh/authorized_keys
 COPY images/ubuntu-26.04-ssh-cvm/overlay/usr/local/sbin/sshd-keygen /usr/local/sbin/sshd-keygen
-# Pre-load Docker's kernel modules at boot (overlay, bridge, br_netfilter,
-# veth, nf_nat, iptable_nat, ip_tables, xt_addrtype, xt_conntrack).
-# systemd-modules-load.service drains modules-load.d before
-# lock-modules.service flips kernel.modules_disabled=1, so this is the
-# only window where we can get them in. After the sysctl is set every
-# modprobe returns EPERM, which is what kills containerd in v0.5.1.
-COPY images/ubuntu-26.04-ssh-cvm/overlay/etc/modules-load.d/docker.conf /etc/modules-load.d/docker.conf
 
 # Lock down perms (Docker COPY preserves source mode; redo here to be
 # explicit and resistant to host umask quirks).
 RUN chmod 700 /root/.ssh \
     && chmod 600 /root/.ssh/authorized_keys \
-    && chmod 755 /usr/local/sbin/sshd-keygen \
-    && chmod 644 /etc/modules-load.d/docker.conf
+    && chmod 755 /usr/local/sbin/sshd-keygen
 
-# Pre-create the mountpoints for /var/lib/{containerd,docker}. These have
-# [[services.mounts]] tmpfs entries in cvm.toml, but systemd's mount unit
-# can't create the mountpoint at runtime — the rootfs is read-only verity
-# squashfs. Without these dirs in the squashfs, containerd.service dies
-# with "mkdir /var/lib/containerd: read-only file system" because the
-# mount doesn't activate, and containerd then falls through to writing
-# directly on the verity rootfs.
+# Mask the in-VM nftables service. The host firewall (see /firewall in
+# the host management plane) is the authoritative gate — running an
+# in-VM nftables on top is duplicate enforcement that just adds
+# friction for the operator who's already root inside. cvmbuild still
+# generates /etc/nftables.conf from cvm.toml's [firewall] block, but
+# masking the service means it never loads at boot.
 #
-# /run/{containerd,docker} mountpoints don't need this — /run is a
-# rw tmpfs at runtime, so systemd creates the dirs there itself.
-RUN mkdir -p /var/lib/containerd /var/lib/docker
+# Production users forking this image who want defense-in-depth
+# remove this line and let the in-VM rules apply.
+RUN ln -sf /dev/null /etc/systemd/system/nftables.service
 
 # /home is empty by design — anything written there is on the read-only
 # rootfs. Operators wanting persistent state should add a [[verity_disks]]

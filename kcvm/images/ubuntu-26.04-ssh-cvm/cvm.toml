@@ -1,82 +1,86 @@
-# ubuntu-26.04-ssh-cvm — confidential VM with direct SSH
+# ubuntu-26.04-ssh-cvm — example developer-friendly CVM with direct SSH
 #
-# A CVM that exposes sshd directly on port 22 (declared in
-# [network].expose_port below). Operators connect with stock SSH — no
-# kawa, no konnect-proxy, no tunnel mode. The host management plane
-# wires its per-VM port forward to this guest port.
+# A CVM that exposes sshd directly on port 22. Operators connect with
+# stock SSH — no kawa, no konnect-proxy, no tunnel mode.
 #
-# Workflow (host management plane provides the boot/forwarding):
-#   1. Boot the VM with this image and get back a host port.
+# This image is an EXAMPLE / starting template. It deliberately relaxes
+# in-VM hardening so the operator inside is unconstrained:
+#   - `lock_modules = false` — modprobe works at runtime, so docker can
+#     lazy-load `overlay` etc. without us pre-loading anything.
+#   - In-VM nftables is masked at boot — the host firewall is the
+#     authoritative gate (see /firewall in the host management plane).
+#   - /var is a single tmpfs — every /var/lib/* path is writable for
+#     containerd, docker, apt, anything else the operator wants.
+#
+# What stays locked (the structural CVM properties):
+#   - Verity rootfs (read-only, panic-on-corruption).
+#   - lockdown=confidentiality on the kernel cmdline (no /dev/kmem,
+#     no kexec_load, no tracefs reads — required for safe SEV/TDX boot).
+#   - SEV-SNP / TDX memory encryption against the host operator.
+#
+# Production users fork this image, swap the test SSH key, optionally
+# add `lock_modules = true` + `[firewall]` rules + tighter mounts for
+# their own threat model. This template is permissive ON PURPOSE so
+# that "I just want to ssh into a TEE box and play around" works.
+#
+# Workflow:
+#   1. Boot the VM with this image.
 #   2. ssh -i kawiri-test -o StrictHostKeyChecking=no \
 #          -o UserKnownHostsFile=/dev/null \
-#          -p <host_port> root@<vm-host>
+#          root@<vm-ip>
 #
-# Attestation is verified post-login by reading /sys/kernel/config/tsm/report
-# directly inside the CVM (see README) — there is no client-side attestation
-# gate before bytes flow. That trade is appropriate for the hosting use case
-# where the operator owns the image identity out-of-band and just wants to
-# confirm "the host booted what I built".
-#
-# Security boundary:
-#   - TEE (SNP/TDX) protects VM memory + disk against the host operator.
-#   - Anyone with kawiri-test's *private* key + a reachable host:port gets
-#     root in the VM. The TEST keypair's pubkey is baked into the rootfs
-#     (overlay/root/.ssh/authorized_keys); a different pubkey produces a
-#     different SNP measurement, which is the right property — production
-#     users fork this image and bake their own pubkey.
+# Attestation: post-login the operator reads
+# /sys/kernel/config/tsm/report directly inside the CVM. The host
+# management plane shows the manifest the image was built from.
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.5.4"
+version = "0.5.5"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
 
 [kernel]
 cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd"
-# `initrd_modules` is currently advisory — cvmbuild copies the dracut-
-# produced initrd as-is, so the actual `--add-drivers` list lives in the
-# kawiri/kcvm/base-image Dockerfile. The mechanism that loads modules
-# Docker needs is overlay/etc/modules-load.d/docker.conf, which runs
-# during boot via systemd-modules-load.service — BEFORE
-# lock-modules.service flips kernel.modules_disabled=1. After that
-# sysctl is set, every modprobe returns EPERM with no log line, which
-# is the failure mode that bit "Failed to start containerd.service" in
-# v0.5.1.
-initrd_modules = [
-  "dm-verity", "dm-mod", "dm-bufio", "squashfs",
-  "virtio-blk", "virtio-pci", "virtio-net", "virtio-scsi",
-  "nf_tables", "nfnetlink", "nf_conntrack",
-  "overlay",
-  "bridge", "br_netfilter", "veth",
-  "nf_nat", "iptable_nat", "ip_tables",
-  "xt_addrtype", "xt_conntrack",
-  "dm-crypt",
-]
+# Required at-boot modules for the dm-verity → squashfs → systemd
+# chain. cvmbuild's assert pass enforces dm-verity + dm-mod here, but
+# does NOT add them to the actual initrd — that list lives in the
+# kawiri/kcvm/base-image Dockerfile's `dracut --add-drivers` line.
+# This block is documentary; for everything beyond the verity boot
+# requirements we let modprobe-on-demand handle it (lock_modules=false
+# below).
+initrd_modules = ["dm-verity", "dm-mod", "dm-bufio", "squashfs"]
 
 [verity]
 enabled = true
 panic_on_corruption = true
 
-# Shells (bash/sh/dash) are intentionally KEPT — this image's whole purpose
-# is to give the SSH user an interactive shell inside an attested CVM. We
-# still strip apt/dpkg/pip/dmsetup since the rootfs is read-only verity
-# anyway and pip is a common attacker-tooling starting point.
+# Shells (bash/sh/dash) are KEPT — this image's point is interactive
+# root inside an attested CVM. apt/dpkg/pip/dmsetup are stripped only
+# because the rootfs is read-only verity anyway, so the package
+# managers couldn't change anything if they tried (and pip is a
+# common attacker-tooling stepping stone).
+#
+# `lock_modules = false`: modprobe works at runtime. The operator IS
+# root and is trusted within the VM. Locking modules made sense for
+# inference CVMs (where the workload is sealed and a hostile-host
+# operator shouldn't be able to drop a rootkit module). For a
+# developer SSH box it just blocks docker, eBPF tooling, etc.
 [security]
 remove = ["apt", "apt-get", "apt-cache", "apt-config", "apt-key", "apt-mark", "dpkg", "dpkg-deb", "dpkg-query", "pip", "pip3", "dmsetup"]
 remove_dirs = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"]
-lock_modules = true
+lock_modules = false
 
-# sshd is the only inbound TCP listener; the host management plane
-# wires its per-VM port forward to CVM:22. ICMP is open so anyone can
-# `ping` the VM (handy for liveness checks). Outbound is open ("allow")
-# so the operator can `apt update`, `git clone`, `docker pull` etc.
-# from inside.
+# This block is decorative — the in-VM nftables.service is masked
+# in the Dockerfile (`ln -sf /dev/null /etc/systemd/system/nftables.service`)
+# so /etc/nftables.conf never loads. Reachability is gated entirely
+# by the HOST firewall (see /firewall in the host management plane).
 #
-# Outbound = "allow" requires excluding `firewall_outbound_deny` from
-# the production assert profile (see [assert].exclude below) — that's
-# the platform's intentional opt-in for "I am a developer-friendly
-# image and accept the responsibility."
+# We keep the inbound list here so the host's port-22 forward is
+# documented as the intended ingress, and so cvmbuild's
+# `firewall_no_ssh` assert sees a matching rule. Outbound stays
+# `allow` so apt/git/docker-pull etc. work — `firewall_outbound_deny`
+# is excluded below.
 [firewall]
 inbound = [
   { port = 22, proto = "tcp" },
@@ -87,10 +91,7 @@ outbound = "allow"
 # [network] tells the host management plane:
 #   1. Which CVM-side port to forward inbound traffic to (here: 22).
 #   2. How to liveness-probe the VM. "none" skips network probing
-#      entirely (the real "is the VM up?" signal is the QEMU process
-#      state). A TCP probe here would connect-and-close on sshd every
-#      few seconds, filling the boot log with `sshd: Connection closed
-#      by 10.0.2.2 ...` for no benefit.
+#      (the real "is the VM up?" signal is the QEMU process state).
 [network]
 expose_port = 22
 probe = "none"
@@ -107,52 +108,27 @@ type = "configfs"
 description = "Kernel Configuration File System"
 condition_path_exists = "/sys/kernel/config"
 
-# Docker's storage root. The rootfs is read-only verity, so /var/lib/docker
-# has nowhere to be persisted on disk. tmpfs is the right trade for an
-# ephemeral SSH-CVM: every reboot wipes containers/images, but operators
-# can `docker load < init.tar` over SSH after login. Forks that want
-# persistent Docker state should add a [[verity_disks]] entry pointing
-# to a writable LV mounted here instead — this image stays ephemeral on
-# purpose. tmpfs sizing is the kernel default (50% of RAM); operator can
-# scale VM memory to match container image sets.
+# /var as a single tmpfs. Replaces what used to be four per-subdir
+# mounts (/var/lib/docker, /var/lib/containerd, /run/docker, /run/containerd
+# — plus cvmbuild's own /var/log + /var/lib/systemd entries). The whole
+# /var becomes RAM-backed: writable, fast, ephemeral. The verity
+# rootfs's /var contents (mostly empty after cvmbuild strips dpkg/apt)
+# are shadowed.
+#
+# This is the right trade for a developer image:
+#   - operators expect /var/lib/* to be writable
+#   - persistent state belongs on a verity_disk anyway, not /var
+#   - "lost on reboot" matches the ephemeral SSH-CVM mental model
 [[services.mounts]]
 what = "tmpfs"
-where = "/var/lib/docker"
+where = "/var"
 type = "tmpfs"
-description = "Docker storage root (ephemeral — overlay2 + container layers)"
-
-# containerd has its own state dir (/var/lib/containerd) — needs to be
-# writable too. Without this, containerd dies on first start with
-# `mkdir /var/lib/containerd: read-only file system`, which then takes
-# docker.service down with it (docker depends on containerd).
-[[services.mounts]]
-what = "tmpfs"
-where = "/var/lib/containerd"
-type = "tmpfs"
-description = "containerd storage state (ephemeral)"
-
-# /run is mounted read-only by cvmbuild's hardening; docker + containerd
-# need writable runtime dirs for sockets and pid files. We can't relax
-# /run globally without weakening the hardening, so we punch out two
-# specific writable subdirectories. systemd lets a child mount be rw
-# even when the parent is ro.
-[[services.mounts]]
-what = "tmpfs"
-where = "/run/docker"
-type = "tmpfs"
-description = "Docker daemon runtime (sockets, pid files)"
-
-[[services.mounts]]
-what = "tmpfs"
-where = "/run/containerd"
-type = "tmpfs"
-description = "containerd runtime (sockets, namespaces)"
+description = "Writable /var (RAM-backed, ephemeral)"
 
 # Generate a fresh ed25519 host key into /run/sshd-keys (tmpfs) at every
 # boot. Operators pass StrictHostKeyChecking=no since attestation is the
 # identity anchor (verified post-SSH via configfs-tsm), not the SSH host
-# key. Embedding a long-lived host private key in a public rootfs would
-# be the wrong trade.
+# key.
 [[services.units]]
 name = "sshd-keygen"
 description = "Generate sshd host keys into /run/sshd-keys"
@@ -168,19 +144,14 @@ extra_options = [
 ]
 
 # sshd unit notes:
-# - Listens on 0.0.0.0:22 — the per-image [network].expose_port above
-#   tells the host management plane where to point its forward, so
-#   operators just `ssh -p <host_port> root@host`.
+# - Listens on 0.0.0.0:22.
 # - All sshd_config knobs passed via -o flags so we don't depend on
 #   /etc/ssh/sshd_config.d/*.conf Include behaviour. Visible in `ps`,
 #   bulletproof for debugging.
-# - PidFile lives under RuntimeDirectory=sshd → /run/sshd is writable;
-#   default /run/sshd.pid would fail because hardening=minimal applies
-#   ProtectSystem=strict, which makes /run read-only outside RW paths.
+# - PidFile lives under RuntimeDirectory=sshd → /run/sshd is writable.
 # - BindReadOnlyPaths overmounts /etc/passwd inside sshd's namespace
 #   with the version that has root=bash (cvmbuild's hardening rewrites
-#   the real /etc/passwd to set every login shell to nologin, which
-#   would make sshd accept the auth then exec "account not available").
+#   the real /etc/passwd to set every login shell to nologin).
 [[services.units]]
 name = "sshd"
 description = "OpenSSH server (the only inbound surface — direct SSH)"
@@ -214,26 +185,22 @@ ovmf_file = "OVMF_TDX.fd"
 
 [assert]
 profile = "production"
-# sshd runs at hardening = "minimal" because pam + /etc/passwd + root
-# login don't coexist with the locked-down profile (the catalog's
-# service_hardening_full_or_minimal check accepts "minimal" — no exclude
-# needed there).
+# sshd runs at hardening=minimal because pam + /etc/passwd + root login
+# don't coexist with the locked-down profile.
 #
-# no_shells / no_shells_extended are excluded because this image's whole
-# point is to give the SSH user an interactive shell.
+# no_shells/no_shells_extended excluded — this image is an interactive shell.
 #
-# firewall_no_ssh is excluded because SSH on port 22 IS the inbound surface
-# for this image. The assert is appropriate for chat-only CVMs that should
-# never expose 22; here it would block the entire image.
+# firewall_no_ssh excluded — SSH on port 22 IS the inbound surface.
 #
-# firewall_outbound_deny is excluded because the SSH-CVM is a
-# developer-friendly box: the operator owns the VM and wants
-# `apt update`, `git clone`, `docker pull` to just work. Open egress
-# is the deliberate trade. Inference-image authors leave this assert
-# in place to keep their zero-trust posture.
+# firewall_outbound_deny excluded — developer image, open egress is the
+# deliberate trade so apt/git/docker-pull work.
+#
+# modules_locked excluded — `lock_modules = false` is intentional for
+# this image. Production users fork and re-enable.
 exclude = [
   "no_shells",
   "no_shells_extended",
   "firewall_no_ssh",
   "firewall_outbound_deny",
+  "modules_locked",
 ]
