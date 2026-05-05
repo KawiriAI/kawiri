@@ -95,6 +95,18 @@ RUN chmod 700 /root/.ssh \
     && chmod 755 /usr/local/sbin/sshd-keygen \
     && chmod 644 /etc/modules-load.d/docker.conf
 
+# Pre-create the mountpoints for /var/lib/{containerd,docker}. These have
+# [[services.mounts]] tmpfs entries in cvm.toml, but systemd's mount unit
+# can't create the mountpoint at runtime — the rootfs is read-only verity
+# squashfs. Without these dirs in the squashfs, containerd.service dies
+# with "mkdir /var/lib/containerd: read-only file system" because the
+# mount doesn't activate, and containerd then falls through to writing
+# directly on the verity rootfs.
+#
+# /run/{containerd,docker} mountpoints don't need this — /run is a
+# rw tmpfs at runtime, so systemd creates the dirs there itself.
+RUN mkdir -p /var/lib/containerd /var/lib/docker
+
 # /home is empty by design — anything written there is on the read-only
 # rootfs. Operators wanting persistent state should add a [[verity_disks]]
 # entry in their fork's cvm.toml; this test image is ephemeral.
