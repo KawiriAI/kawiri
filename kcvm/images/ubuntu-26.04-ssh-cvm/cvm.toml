@@ -27,33 +27,29 @@
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.5.1"
+version = "0.5.2"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
 
 [kernel]
 cmdline = "root=/dev/mapper/root init=/usr/lib/systemd/systemd lockdown=confidentiality intel_iommu=on amd_iommu=on iommu=pt systemd.verity_root_data=/dev/vda1 systemd.verity_root_hash=/dev/vda2 systemd.verity_root_options=panic-on-corruption noresume modprobe.blacklist=ahci i8042.noaux i8042.nokbd"
-# Modules added on top of the SSH-only baseline are all here for Docker:
-#   - overlay              storage driver (overlay2 is Docker's default)
-#   - bridge, br_netfilter container bridge + iptables on bridged traffic
-#   - veth                 host↔container network pair
-#   - nf_nat, iptable_nat,
-#     ip_tables, xt_addrtype,
-#     xt_conntrack          container egress NAT + the matchers Docker installs
-#   - ipt_MASQUERADE       SNAT for container egress
-#   - dm-crypt             LUKS support for the operator's writable data
-#                          disk (see "Persistent encrypted storage" in README)
-# lock_modules=true seals modprobe after init, so all of these have to be
-# loaded from the initrd. Modules built into the host kernel are no-ops in
-# this list.
+# `initrd_modules` is currently advisory — cvmbuild copies the dracut-
+# produced initrd as-is, so the actual `--add-drivers` list lives in the
+# kawiri/kcvm/base-image Dockerfile. The mechanism that loads modules
+# Docker needs is overlay/etc/modules-load.d/docker.conf, which runs
+# during boot via systemd-modules-load.service — BEFORE
+# lock-modules.service flips kernel.modules_disabled=1. After that
+# sysctl is set, every modprobe returns EPERM with no log line, which
+# is the failure mode that bit "Failed to start containerd.service" in
+# v0.5.1.
 initrd_modules = [
   "dm-verity", "dm-mod", "dm-bufio", "squashfs",
   "virtio-blk", "virtio-pci", "virtio-net", "virtio-scsi",
   "nf_tables", "nfnetlink", "nf_conntrack",
   "overlay",
   "bridge", "br_netfilter", "veth",
-  "nf_nat", "iptable_nat", "ip_tables", "ipt_MASQUERADE",
+  "nf_nat", "iptable_nat", "ip_tables",
   "xt_addrtype", "xt_conntrack",
   "dm-crypt",
 ]
@@ -124,6 +120,33 @@ what = "tmpfs"
 where = "/var/lib/docker"
 type = "tmpfs"
 description = "Docker storage root (ephemeral — overlay2 + container layers)"
+
+# containerd has its own state dir (/var/lib/containerd) — needs to be
+# writable too. Without this, containerd dies on first start with
+# `mkdir /var/lib/containerd: read-only file system`, which then takes
+# docker.service down with it (docker depends on containerd).
+[[services.mounts]]
+what = "tmpfs"
+where = "/var/lib/containerd"
+type = "tmpfs"
+description = "containerd storage state (ephemeral)"
+
+# /run is mounted read-only by cvmbuild's hardening; docker + containerd
+# need writable runtime dirs for sockets and pid files. We can't relax
+# /run globally without weakening the hardening, so we punch out two
+# specific writable subdirectories. systemd lets a child mount be rw
+# even when the parent is ro.
+[[services.mounts]]
+what = "tmpfs"
+where = "/run/docker"
+type = "tmpfs"
+description = "Docker daemon runtime (sockets, pid files)"
+
+[[services.mounts]]
+what = "tmpfs"
+where = "/run/containerd"
+type = "tmpfs"
+description = "containerd runtime (sockets, namespaces)"
 
 # Generate a fresh ed25519 host key into /run/sshd-keys (tmpfs) at every
 # boot. Operators pass StrictHostKeyChecking=no since attestation is the
