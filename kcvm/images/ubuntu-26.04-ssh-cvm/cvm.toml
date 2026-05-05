@@ -27,7 +27,7 @@
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.5.2"
+version = "0.5.3"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
