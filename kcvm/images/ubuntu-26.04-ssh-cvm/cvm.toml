@@ -35,7 +35,7 @@
 
 [image]
 id = "ubuntu-26.04-ssh-cvm"
-version = "0.5.5"
+version = "0.5.6"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
@@ -134,7 +134,7 @@ name = "sshd-keygen"
 description = "Generate sshd host keys into /run/sshd-keys"
 exec = "/usr/local/sbin/sshd-keygen"
 service_type = "oneshot"
-hardening = "minimal"
+hardening = "none"
 after = ["local-fs.target"]
 extra_options = [
   "RemainAfterExit=yes",
@@ -152,6 +152,14 @@ extra_options = [
 # - BindReadOnlyPaths overmounts /etc/passwd inside sshd's namespace
 #   with the version that has root=bash (cvmbuild's hardening rewrites
 #   the real /etc/passwd to set every login shell to nologin).
+# - hardening = "none" because this is a developer-friendly image.
+#   "minimal" applies ProtectSystem=strict which makes /run, /var,
+#   and /etc read-only inside the SSH session — every system command
+#   the operator runs (cryptsetup, mount, reboot, modprobe with
+#   side-effects) hits ro-fs errors. "minimal" is the right default
+#   for inference CVMs where sshd shouldn't exist at all; for an
+#   image whose entire purpose is interactive root, locking sshd's
+#   filesystem view is the wrong trade.
 [[services.units]]
 name = "sshd"
 description = "OpenSSH server (the only inbound surface — direct SSH)"
@@ -167,7 +175,7 @@ exec = """\
 after = ["sshd-keygen.service", "network-online.target"]
 requires = ["sshd-keygen.service"]
 wants = ["network-online.target"]
-hardening = "minimal"
+hardening = "none"
 extra_options = [
   "RuntimeDirectory=sshd",
   "RuntimeDirectoryMode=0755",
@@ -203,4 +211,11 @@ exclude = [
   "firewall_no_ssh",
   "firewall_outbound_deny",
   "modules_locked",
+  # service_hardening_no_none rejects hardening="none" — but for this
+  # interactive-developer image, sshd's ProtectSystem=strict (applied at
+  # "minimal") makes every operator command run inside a sandbox where
+  # /run, /var, and /etc look ro. cryptsetup, mount, reboot, modprobe etc.
+  # all silently fail. Production images keep the assert.
+  "service_hardening_no_none",
+  "service_hardening_full_or_minimal",
 ]
