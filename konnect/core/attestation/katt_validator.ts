@@ -51,9 +51,12 @@ export class KattValidator implements AttestationValidator {
     if (payload.platform === "mock") {
       if (this.opts.allowMock === true) {
         console.warn(
-          "[kawiri] ⚠ MOCK ATTESTATION accepted — server is NOT running in a confidential TEE. " +
-            "Data is not hardware-protected. Every message on this connection will WARN. " +
-            "Do not use in production.",
+          "[kawiri] ⚠ MOCK ATTESTATION accepted — server is NOT in a confidential TEE. " +
+            "Wire stays end-to-end encrypted (Noise + X-Wing), but plaintext exists inside " +
+            "the VM's RAM during processing. Without TEE, an operator with host-root could " +
+            "read that RAM (gdb, QMP pmemsave, etc.) and extract messages with deliberate " +
+            "effort. Hardware TEE (SEV-SNP / TDX) encrypts VM RAM with a CPU-held key the " +
+            "host can't see. Do not send sensitive data in this mode.",
         );
         return { valid: true, mode: "mock" };
       }
