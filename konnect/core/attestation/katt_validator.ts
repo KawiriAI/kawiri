@@ -161,7 +161,11 @@ export class KattValidator implements AttestationValidator {
 // --- Helpers ---
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
-  const hash = await crypto.subtle.digest("SHA-256", data);
+  // Cast through BufferSource: TS 5.7+ tightened the libdom signature so
+  // Uint8Array<ArrayBufferLike> (covers SharedArrayBuffer-backed Uint8Arrays)
+  // no longer auto-satisfies BufferSource. Our caller always passes a
+  // plain ArrayBuffer-backed Uint8Array, so the cast is safe at runtime.
+  const hash = await crypto.subtle.digest("SHA-256", data as BufferSource);
   return bytesToHex(new Uint8Array(hash));
 }
 
