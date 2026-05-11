@@ -18,6 +18,36 @@ use tracing::{debug, info, warn};
 /// Prevents resource exhaustion from connection floods.
 const MAX_CONCURRENT_HANDSHAKES: usize = 50;
 
+/// Wire format for every server→client binary WebSocket frame:
+///
+/// ```text
+///   [u32 little-endian: data_len]
+///   [data_len bytes: encrypted Noise payload (may be zero-length)]
+///   [remaining bytes: optional UTF-8 JSON `meta` envelope, router-readable]
+/// ```
+///
+/// Cases the router has to handle:
+///   data populated, meta empty  → ordinary encrypted chunk
+///   data populated, meta JSON   → encrypted chunk + per-chunk meta
+///                                  (e.g. `{"tokens":1}` for live token ticks)
+///   data empty,    meta JSON    → pure-meta frame, typically at end of request
+///                                  carrying `{"usage":{…},"finish_reason":…}`
+///
+/// The router parses the envelope, logs/forwards meta as needed, then sends
+/// ONLY the `data` portion onward to the browser as a raw WS frame — so the
+/// client side speaks today's untagged-Noise protocol untouched.
+///
+/// Client→server direction stays untouched (raw Noise bytes); we never need
+/// the client to add meta and the router has nothing to demux that way.
+fn wrap_frame(data: &[u8], meta: Option<&[u8]>) -> Vec<u8> {
+    let meta_bytes = meta.unwrap_or(&[]);
+    let mut buf = Vec::with_capacity(4 + data.len() + meta_bytes.len());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(meta_bytes);
+    buf
+}
+
 // ── TDX v4 quote layout (Intel TDX DCAP Quote Generation §A.3.1) ────────────
 //   48-byte header, then 584-byte TD Report body.
 //   Body fields (sequential): teeTcbSvn(16) mrseam(48) mrsignerseam(48)
@@ -219,9 +249,12 @@ async fn handle_websocket(
     let attestation = tee::generate_attestation(keypair.public_key(), tee_mode).await?;
     let attestation_json = serde_json::to_vec(&attestation)?;
 
-    // msg 1: send ephemeral + static + attestation
+    // msg 1: send ephemeral + static + attestation. Wrapped in the
+    // length-prefixed envelope like every other outbound frame.
     let msg1 = responder.write_msg1(&attestation_json)?;
-    ws_sink.send(Message::binary(msg1)).await?;
+    ws_sink
+        .send(Message::binary(wrap_frame(&msg1, None)))
+        .await?;
 
     // msg 2: read client static
     let msg2: Vec<u8> = recv_binary!(ws_stream)?;
@@ -306,6 +339,16 @@ async fn handle_websocket(
             continue;
         }
 
+        // Pull `model` out of the request before we forward — it ends up
+        // in the meta envelope so the router can attribute usage without
+        // ever needing to see the encrypted body.
+        let req_model = req
+            .body
+            .as_ref()
+            .and_then(|b| b.get("model"))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string());
+
         // Proxy to upstream
         let (tx, mut rx) = mpsc::channel::<ProxyEvent>(32);
         let client = Arc::clone(&http_client);
@@ -328,10 +371,35 @@ async fn handle_websocket(
         });
 
         let req_id = req.id;
+        let req_start = std::time::Instant::now();
+        let mut last_usage: Option<serde_json::Value> = None;
+        let mut last_finish_reason: Option<String> = None;
+        let mut error_msg: Option<String> = None;
         while let Some(event) = rx.recv().await {
             match event {
                 ProxyEvent::Chunk(data) => {
                     if is_stream {
+                        // Sniff usage + finish_reason out of streaming
+                        // chunks so the router can read them in the meta
+                        // envelope. Requires the client (or kawa via a
+                        // future patch) to enable `stream_options.include_usage`;
+                        // when absent, last_usage stays None and the meta
+                        // envelope just lacks token counts.
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                            if let Some(u) = parsed.get("usage") {
+                                if !u.is_null() {
+                                    last_usage = Some(u.clone());
+                                }
+                            }
+                            if let Some(fr) = parsed
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c.get("finish_reason"))
+                                .and_then(|v| v.as_str())
+                            {
+                                last_finish_reason = Some(fr.to_string());
+                            }
+                        }
                         let chunk = KawiriStreamChunk {
                             id: req_id,
                             event: "data".into(),
@@ -341,6 +409,19 @@ async fn handle_websocket(
                     } else {
                         let body = serde_json::from_str::<serde_json::Value>(&data)
                             .unwrap_or(serde_json::Value::String(data));
+                        if let Some(u) = body.get("usage") {
+                            if !u.is_null() {
+                                last_usage = Some(u.clone());
+                            }
+                        }
+                        if let Some(fr) = body
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("finish_reason"))
+                            .and_then(|v| v.as_str())
+                        {
+                            last_finish_reason = Some(fr.to_string());
+                        }
                         let resp = KawiriResponse {
                             id: req_id,
                             status: 200,
@@ -360,6 +441,7 @@ async fn handle_websocket(
                     }
                 }
                 ProxyEvent::Error(msg) => {
+                    error_msg = Some(msg.clone());
                     let chunk = KawiriStreamChunk {
                         id: req_id,
                         event: "error".into(),
@@ -368,6 +450,24 @@ async fn handle_websocket(
                     send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
                 }
             }
+        }
+
+        // Send the end-of-request meta envelope: usage, model, finish_reason,
+        // duration. Pure-meta frame (`data_len = 0`), the router consumes it
+        // and forwards nothing to the browser. Errors here don't tear down
+        // the connection — metering is a best-effort sidecar.
+        let meta = serde_json::json!({
+            "object": "kawiri.usage",
+            "req_id": req_id,
+            "model": req_model,
+            "usage": last_usage,
+            "duration_ms": req_start.elapsed().as_millis() as u64,
+            "finish_reason": last_finish_reason,
+            "status": if error_msg.is_some() { "error" } else { "ok" },
+            "error": error_msg,
+        });
+        if let Err(e) = send_meta_only(&mut ws_sink, &meta).await {
+            warn!(error = %e, "failed to send meta frame");
         }
     }
 
@@ -399,7 +499,9 @@ where
     };
     let msg1_json = serde_json::to_vec(&msg1)?;
     let encrypted = transport.encrypt(&msg1_json)?;
-    ws_sink.send(Message::binary(encrypted)).await?;
+    ws_sink
+        .send(Message::binary(wrap_frame(&encrypted, None)))
+        .await?;
 
     // Receive ciphertext
     let raw = loop {
@@ -474,8 +576,25 @@ where
     let frames = framer::encode(data);
     for frame in frames {
         let encrypted = transport.encrypt(&frame)?;
-        ws_sink.send(Message::binary(encrypted)).await?;
+        ws_sink
+            .send(Message::binary(wrap_frame(&encrypted, None)))
+            .await?;
     }
+    Ok(())
+}
+
+/// Send a pure-meta envelope (no `data`, just JSON in the meta slot).
+/// Used once per request at end-of-stream to deliver usage stats to
+/// the router. No-op-safe: the router treats an empty `data` as
+/// "nothing to forward to the browser" and only consumes the meta.
+async fn send_meta_only<S>(ws_sink: &mut S, meta: &serde_json::Value) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
+{
+    let meta_bytes = serde_json::to_vec(meta)?;
+    ws_sink
+        .send(Message::binary(wrap_frame(&[], Some(&meta_bytes))))
+        .await?;
     Ok(())
 }
 
