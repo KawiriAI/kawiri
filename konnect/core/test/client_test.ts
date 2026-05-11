@@ -21,6 +21,21 @@ interface MockWSData {
   incoming: ReturnType<typeof wsChannel>;
 }
 
+/**
+ * Wrap server→client bytes in the kawa wire envelope:
+ * `[u32 LE: data_len][data][meta]`. Mirrors `kawa::server::wrap_frame`.
+ * The mock server uses this for every outbound send so tests exercise
+ * the same protocol the real client speaks against the real server.
+ */
+function envelopeWrap(data: Uint8Array, meta?: Uint8Array): Uint8Array {
+  const metaBytes = meta ?? new Uint8Array(0);
+  const out = new Uint8Array(4 + data.length + metaBytes.length);
+  new DataView(out.buffer).setUint32(0, data.length, true);
+  out.set(data, 4);
+  out.set(metaBytes, 4 + data.length);
+  return out;
+}
+
 /** Async channel for WebSocket message routing */
 function wsChannel() {
   const queue: Uint8Array[] = [];
@@ -113,7 +128,7 @@ async function handleSocket(
     .join("");
   const attestation: AttestationPayload = { platform: "mock", nonce };
   const msg1 = await responder.writeMessage(new TextEncoder().encode(JSON.stringify(attestation)));
-  ws.send(msg1);
+  ws.send(envelopeWrap(msg1));
 
   // msg 2: read
   const msg2Data = await incoming.pull();
@@ -123,7 +138,7 @@ async function handleSocket(
   if (enablePQ) {
     const send = async (d: Uint8Array) => {
       const ct = await transport.encrypt(d);
-      ws.send(ct);
+      ws.send(envelopeWrap(ct));
     };
     const receive = async () => {
       const ct = await incoming.pull();
@@ -165,7 +180,7 @@ async function handleRequest(req: KawiriRequest, transport: TransportState, ws: 
     const frames = Framer.encode(data);
     for (const frame of frames) {
       const ct = await transport.encrypt(frame);
-      ws.send(ct);
+      ws.send(envelopeWrap(ct));
     }
   };
 

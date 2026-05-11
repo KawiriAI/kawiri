@@ -1,6 +1,7 @@
 import { type AttestationValidator, StubValidator } from "./attestation/validator.ts";
 import * as X25519 from "./noise/crypto.ts";
 import { HandshakeState, type TransportState } from "./noise/mod.ts";
+import * as Envelope from "./transport/envelope.ts";
 import * as Framer from "./transport/framer.ts";
 import { FrameAssembler } from "./transport/framer.ts";
 import type {
@@ -149,7 +150,27 @@ export class KawiriClient {
       };
 
       ws.onmessage = async (event: MessageEvent) => {
-        msgQueue.push(new Uint8Array(event.data as ArrayBuffer));
+        // Every server→client frame is wrapped in a 4-byte-length
+        // envelope (see ./transport/envelope.ts). Strip it before
+        // feeding bytes into the Noise state machine. Pure-meta
+        // frames (end-of-stream usage from kawa) decode to an empty
+        // payload and are just skipped — they're for routers, not
+        // the client.
+        let payload: Uint8Array;
+        try {
+          payload = Envelope.unwrap(new Uint8Array(event.data as ArrayBuffer));
+        } catch (err) {
+          // A frame we can't parse is a protocol-level mismatch
+          // (e.g. talking to a pre-envelope kawa). Tearing down is
+          // the right move — keeping the socket open would silently
+          // mis-decode Noise.
+          console.error("[kawiri] malformed wire envelope:", err);
+          if (step < 3) doSettle(false, err as Error);
+          else ws.close(4010, "malformed wire envelope");
+          return;
+        }
+        if (payload.length === 0) return;
+        msgQueue.push(payload);
         if (processing) return;
         processing = true;
         try {
