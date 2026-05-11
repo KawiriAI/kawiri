@@ -50,8 +50,8 @@ export class KawiriClient {
   private _timing: ConnectTiming | null = null;
   /**
    * True when the validator accepted a `platform: "mock"` attestation.
-   * Drives the per-message warnings — every send and every recv emits a
-   * `console.warn` so an operator skimming devtools can't miss it.
+   * Emits a single warn at handshake completion (see connect()); per-frame
+   * warns were dropped because they flooded devtools without adding signal.
    */
   private isMockConnection = false;
 
@@ -180,7 +180,7 @@ export class KawiriClient {
             if (this.isMockConnection) {
               console.warn(
                 "[kawiri] ⚠ Connection established to MOCK kawa — no TEE attestation. " +
-                  "Every message on this connection will emit a warning. Production validators reject this.",
+                  "Production validators reject this.",
               );
             }
 
@@ -274,9 +274,6 @@ export class KawiriClient {
 
   private async handleTransportMessage(data: Uint8Array): Promise<void> {
     if (!this.transport) throw new Error("transport not established");
-    if (this.isMockConnection) {
-      console.warn("[kawiri] ⚠ recv on MOCK connection (no TEE backing this transport)");
-    }
     const plainFrame = await this.transport.decrypt(data);
     const decoded = Framer.decode(plainFrame);
 
@@ -362,9 +359,6 @@ export class KawiriClient {
   private async sendRequest(req: KawiriRequest): Promise<void> {
     if (!this._connected || !this.transport || !this.ws) {
       throw new Error("Not connected");
-    }
-    if (this.isMockConnection) {
-      console.warn("[kawiri] ⚠ send on MOCK connection (no TEE backing this transport)");
     }
     const json = JSON.stringify(req);
     const data = new TextEncoder().encode(json);
