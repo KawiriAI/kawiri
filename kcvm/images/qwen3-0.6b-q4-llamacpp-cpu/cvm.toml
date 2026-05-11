@@ -3,7 +3,7 @@
 
 [image]
 id = "qwen3-0.6b-q4-llamacpp-cpu"
-version = "0.1.0"
+version = "0.1.1"
 base = "Dockerfile"
 context = "../.."
 ovmf_version = "0.1.0"
@@ -66,7 +66,7 @@ condition_path_exists = "/sys/kernel/config"
 [[services.units]]
 name = "llamacpp"
 description = "llama.cpp inference server"
-exec = "/usr/local/bin/llama-server --model ${LLAMACPP_MODEL} --host 127.0.0.1 --port 8080 --ctx-size 2048 --threads ${LLAMACPP_THREADS} --chat-template chatml"
+exec = "/usr/local/bin/llama-server --model ${LLAMACPP_MODEL} --host 127.0.0.1 --port 8080 --ctx-size 8192 --threads ${LLAMACPP_THREADS} --jinja"
 after = ["verity-config.service", "verity-models.service", "lock-modules.service"]
 requires = ["verity-config.service", "verity-models.service"]
 environment_file = "/mnt/config/config.env"
