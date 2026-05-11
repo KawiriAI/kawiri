@@ -1,6 +1,6 @@
 {
   "name": "@kawiri/konnect",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "exports": "./core/mod.ts",
   "scripts": {

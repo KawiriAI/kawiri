@@ -37,6 +37,15 @@ interface PendingRequest {
   resolve: (value: ChatResult) => void;
   reject: (err: Error) => void;
   stream?: ReadableStreamDefaultController<string>;
+  /**
+   * True between the first `delta.reasoning_content` token and the
+   * first `delta.content` token (or stream end). Lets us emit
+   * synthetic `<think>` / `</think>` markers around the reasoning
+   * stream so downstream consumers (chat's Transcript) can render
+   * the reasoning as a separate panel without speaking llama.cpp's
+   * extended OpenAI schema. Reset between requests.
+   */
+  reasoningOpen?: boolean;
 }
 
 export class KawiriClient {
@@ -317,8 +326,27 @@ export class KawiriClient {
         // Parse SSE data if it's a string
         try {
           const parsed = typeof chunk.data === "string" ? JSON.parse(chunk.data) : chunk.data;
-          const content = parsed?.choices?.[0]?.delta?.content ?? parsed?.choices?.[0]?.message?.content ?? "";
+          const delta = parsed?.choices?.[0]?.delta;
+          const reasoning: string = delta?.reasoning_content ?? parsed?.choices?.[0]?.message?.reasoning_content ?? "";
+          const content: string = delta?.content ?? parsed?.choices?.[0]?.message?.content ?? "";
+
+          // Reasoning tokens are wrapped in synthetic <think>...</think>
+          // markers so chat's Transcript renders them as a Reasoning
+          // panel without needing per-token type info. Open the wrapper
+          // on the first reasoning token, close it the moment the
+          // first non-empty content token arrives.
+          if (reasoning) {
+            if (!p.reasoningOpen) {
+              p.stream.enqueue("<think>");
+              p.reasoningOpen = true;
+            }
+            p.stream.enqueue(reasoning);
+          }
           if (content) {
+            if (p.reasoningOpen) {
+              p.stream.enqueue("</think>");
+              p.reasoningOpen = false;
+            }
             p.stream.enqueue(content);
           }
         } catch {
@@ -326,6 +354,13 @@ export class KawiriClient {
           p.stream.enqueue(String(chunk.data));
         }
       } else if (chunk.event === "done") {
+        // Edge case: stream ended mid-reasoning (max_tokens cut in before
+        // the answer started). Close the synthetic <think> so the UI
+        // doesn't render an open-ended reasoning block.
+        if (p.reasoningOpen) {
+          p.stream.enqueue("</think>");
+          p.reasoningOpen = false;
+        }
         p.stream.close();
         this.pending.delete(chunk.id);
       }
@@ -339,10 +374,21 @@ export class KawiriClient {
       const body = resp.body;
       if (body && typeof body === "object" && "choices" in body) {
         const obj = body as Record<string, unknown>;
-        const choices = obj.choices as { message?: { content?: string }; finish_reason?: string }[] | undefined;
+        const choices = obj.choices as
+          | {
+              message?: { content?: string; reasoning_content?: string };
+              finish_reason?: string;
+            }[]
+          | undefined;
         const choice = choices?.[0];
+        const reasoning = choice?.message?.reasoning_content ?? "";
+        const answer = choice?.message?.content ?? "";
+        // Mirror the streaming path: wrap reasoning_content in
+        // <think>...</think> so callers parsing combined content see
+        // the same shape as a streamed response.
+        const content = reasoning ? `<think>${reasoning}</think>${answer}` : answer;
         p.resolve({
-          content: choice?.message?.content ?? "",
+          content,
           usage: obj.usage as ChatResult["usage"],
           model: obj.model as string | undefined,
           finish_reason: choice?.finish_reason,
