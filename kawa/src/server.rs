@@ -68,6 +68,7 @@ const SNP_HOST_DATA: usize = 0xc0; // 32 bytes
 const SNP_MIN_LEN: usize = 0xe0; // through end of hostData
 
 use crate::config::Config;
+use crate::meter::{self, Accumulator};
 use crate::protocol::framer::{self, FrameAssembler};
 use crate::protocol::noise::{NoiseResponder, StaticKeypair};
 use crate::protocol::transport::EncryptedTransport;
@@ -329,7 +330,7 @@ async fn handle_websocket(
                     req.path
                 ))),
             };
-            send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
+            send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk, None).await?;
             continue;
         }
 
@@ -339,23 +340,42 @@ async fn handle_websocket(
             continue;
         }
 
-        // Pull `model` out of the request before we forward — it ends up
-        // in the meta envelope so the router can attribute usage without
-        // ever needing to see the encrypted body.
+        // Build the per-request metering accumulator. From here on,
+        // EVERYTHING that ends up in the meta envelope flows through
+        // `acc` — typed, count-only, content-free. See `meter.rs` for
+        // the privacy invariants.
+        let req_id = req.id;
         let req_model = req
             .body
             .as_ref()
             .and_then(|b| b.get("model"))
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
+        let mut acc = Accumulator::new(req_id, req_model);
 
-        // Proxy to upstream
+        // Mutate the outgoing body to enable per-chunk and final-chunk
+        // usage reporting from whichever inference engine is upstream.
+        // This is a metadata-only mutation (it only touches the
+        // `stream_options` field); user prompt content in `messages`
+        // is untouched. See `meter::inject_usage_flags`.
+        //
+        // Gated on chat-completions paths because `stream_options` is
+        // chat-completions-specific in the OpenAI spec — injecting it
+        // into `/v1/embeddings` or `/v1/models` would be at best noise
+        // and at worst a 400 from a stricter upstream.
+        let mut body = req.body.clone();
+        if req.path.ends_with("/chat/completions") {
+            if let Some(b) = body.as_mut() {
+                meter::inject_usage_flags(b);
+            }
+        }
+
+        // Proxy to upstream.
         let (tx, mut rx) = mpsc::channel::<ProxyEvent>(32);
         let client = Arc::clone(&http_client);
         let upstream = config.upstream.clone();
         let method = req.method.clone();
         let path = req.path.clone();
-        let body = req.body.clone();
 
         tokio::spawn(async move {
             proxy::proxy_to_upstream(
@@ -370,62 +390,44 @@ async fn handle_websocket(
             .await;
         });
 
-        let req_id = req.id;
-        let req_start = std::time::Instant::now();
-        let mut last_usage: Option<serde_json::Value> = None;
-        let mut last_finish_reason: Option<String> = None;
-        let mut error_msg: Option<String> = None;
         while let Some(event) = rx.recv().await {
             match event {
                 ProxyEvent::Chunk(data) => {
                     if is_stream {
-                        // Sniff usage + finish_reason out of streaming
-                        // chunks so the router can read them in the meta
-                        // envelope. Requires the client (or kawa via a
-                        // future patch) to enable `stream_options.include_usage`;
-                        // when absent, last_usage stays None and the meta
-                        // envelope just lacks token counts.
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                            if let Some(u) = parsed.get("usage") {
-                                if !u.is_null() {
-                                    last_usage = Some(u.clone());
-                                }
-                            }
-                            if let Some(fr) = parsed
-                                .get("choices")
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c.get("finish_reason"))
-                                .and_then(|v| v.as_str())
-                            {
-                                last_finish_reason = Some(fr.to_string());
-                            }
-                        }
+                        // Parse the chunk so meter.rs can extract counts
+                        // (typed, content-free). The parsed `data` is
+                        // used purely as a heuristic input + then dropped
+                        // — it's never serialized externally.
+                        let parsed = serde_json::from_str::<serde_json::Value>(&data).ok();
+                        let chunk_meta_bytes = parsed.as_ref().and_then(|p| {
+                            acc.ingest_chunk(p);
+                            meter::chunk_meta_for(req_id, p)
+                                .and_then(|cm| serde_json::to_vec(&cm).ok())
+                        });
+
                         let chunk = KawiriStreamChunk {
                             id: req_id,
                             event: "data".into(),
                             data: Some(serde_json::Value::String(data)),
                         };
-                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
+                        send_encrypted_chunk(
+                            transport.as_mut(),
+                            &mut ws_sink,
+                            &chunk,
+                            chunk_meta_bytes.as_deref(),
+                        )
+                        .await?;
                     } else {
-                        let body = serde_json::from_str::<serde_json::Value>(&data)
+                        // Renamed from `body` to avoid shadowing the
+                        // outer request `body` and to make the read of
+                        // an *upstream response* unambiguous.
+                        let parsed_response = serde_json::from_str::<serde_json::Value>(&data)
                             .unwrap_or(serde_json::Value::String(data));
-                        if let Some(u) = body.get("usage") {
-                            if !u.is_null() {
-                                last_usage = Some(u.clone());
-                            }
-                        }
-                        if let Some(fr) = body
-                            .get("choices")
-                            .and_then(|c| c.get(0))
-                            .and_then(|c| c.get("finish_reason"))
-                            .and_then(|v| v.as_str())
-                        {
-                            last_finish_reason = Some(fr.to_string());
-                        }
+                        acc.ingest_response_body(&parsed_response);
                         let resp = KawiriResponse {
                             id: req_id,
                             status: 200,
-                            body: Some(body),
+                            body: Some(parsed_response),
                         };
                         send_encrypted_response(transport.as_mut(), &mut ws_sink, &resp).await?;
                     }
@@ -437,37 +439,30 @@ async fn handle_websocket(
                             event: "done".into(),
                             data: None,
                         };
-                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
+                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk, None)
+                            .await?;
                     }
                 }
                 ProxyEvent::Error(msg) => {
-                    error_msg = Some(msg.clone());
+                    acc.ingest_error(&msg);
                     let chunk = KawiriStreamChunk {
                         id: req_id,
                         event: "error".into(),
                         data: Some(serde_json::Value::String(msg)),
                     };
-                    send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
+                    send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk, None).await?;
                 }
             }
         }
 
-        // Send the end-of-request meta envelope: usage, model, finish_reason,
-        // duration. Pure-meta frame (`data_len = 0`), the router consumes it
-        // and forwards nothing to the browser. Errors here don't tear down
-        // the connection — metering is a best-effort sidecar.
-        let meta = serde_json::json!({
-            "object": "kawiri.usage",
-            "req_id": req_id,
-            "model": req_model,
-            "usage": last_usage,
-            "duration_ms": req_start.elapsed().as_millis() as u64,
-            "finish_reason": last_finish_reason,
-            "status": if error_msg.is_some() { "error" } else { "ok" },
-            "error": error_msg,
-        });
+        // End-of-request meta envelope. `acc.finalize()` returns a
+        // typed `Meta` whose fields are constrained by the type
+        // system (counts + closed-set strings only). serde::Serialize
+        // is the only way it leaves kawa; an auditor can verify the
+        // shape entirely from meter.rs.
+        let meta = acc.finalize();
         if let Err(e) = send_meta_only(&mut ws_sink, &meta).await {
-            warn!(error = %e, "failed to send meta frame");
+            warn!(error = %e, "failed to send end-of-stream meta envelope");
         }
     }
 
@@ -548,46 +543,59 @@ where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
     let bytes = serde_json::to_vec(resp)?;
-    send_encrypted_bytes(transport, ws_sink, &bytes).await
+    send_encrypted_bytes(transport, ws_sink, &bytes, None).await
 }
 
-/// Encrypt and send a serializable stream chunk over WebSocket.
+/// Encrypt and send a serializable stream chunk over WebSocket. If
+/// `meta` is provided, it is attached to the FIRST wire frame
+/// produced from this chunk (subsequent wire frames carry no meta).
+/// The meta bytes are router-readable cleartext JSON — see meter.rs
+/// for what is allowed to appear there.
 async fn send_encrypted_chunk<S>(
     transport: &mut dyn EncryptedTransport,
     ws_sink: &mut S,
     chunk: &KawiriStreamChunk,
+    meta: Option<&[u8]>,
 ) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
     let bytes = serde_json::to_vec(chunk)?;
-    send_encrypted_bytes(transport, ws_sink, &bytes).await
+    send_encrypted_bytes(transport, ws_sink, &bytes, meta).await
 }
 
-/// Encrypt, frame, and send raw bytes over WebSocket.
+/// Encrypt, frame, and send raw bytes over WebSocket. Optional meta
+/// is attached to the first wire frame only — the router gets the
+/// running token count as soon as the chunk starts, instead of
+/// waiting for a large chunk's tail.
 async fn send_encrypted_bytes<S>(
     transport: &mut dyn EncryptedTransport,
     ws_sink: &mut S,
     data: &[u8],
+    meta: Option<&[u8]>,
 ) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
     let frames = framer::encode(data);
-    for frame in frames {
+    for (i, frame) in frames.into_iter().enumerate() {
         let encrypted = transport.encrypt(&frame)?;
+        let frame_meta = if i == 0 { meta } else { None };
         ws_sink
-            .send(Message::binary(wrap_frame(&encrypted, None)))
+            .send(Message::binary(wrap_frame(&encrypted, frame_meta)))
             .await?;
     }
     Ok(())
 }
 
-/// Send a pure-meta envelope (no `data`, just JSON in the meta slot).
-/// Used once per request at end-of-stream to deliver usage stats to
-/// the router. No-op-safe: the router treats an empty `data` as
-/// "nothing to forward to the browser" and only consumes the meta.
-async fn send_meta_only<S>(ws_sink: &mut S, meta: &serde_json::Value) -> anyhow::Result<()>
+/// Send a pure-meta envelope (no `data`, just JSON in the meta
+/// slot). Used once per request at end-of-stream. The router treats
+/// an empty `data` as "nothing to forward to the browser" and only
+/// consumes the meta.
+///
+/// Takes a typed `meter::Meta` so the serialized bytes are
+/// structurally constrained — see meter.rs for the privacy story.
+async fn send_meta_only<S>(ws_sink: &mut S, meta: &meter::Meta) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
@@ -615,14 +623,14 @@ where
                 "choices": [{"delta": {"content": "Hello from kawa standalone"}}]
             })),
         };
-        send_encrypted_chunk(transport, ws_sink, &chunk).await?;
+        send_encrypted_chunk(transport, ws_sink, &chunk, None).await?;
 
         let done = KawiriStreamChunk {
             id: req.id,
             event: "done".into(),
             data: None,
         };
-        send_encrypted_chunk(transport, ws_sink, &done).await?;
+        send_encrypted_chunk(transport, ws_sink, &done, None).await?;
     } else {
         let resp = KawiriResponse {
             id: req.id,

@@ -1,4 +1,5 @@
 mod config;
+mod meter;
 mod protocol;
 mod proxy;
 mod server;
