@@ -31,43 +31,7 @@ export interface KawiriClientOptions {
   connectTimeout?: number; // default: 10000 (10s)
   debug?: boolean; // default: false — log handshake timing via console.debug
   onDisconnect?: (reason: string) => void;
-  /**
-   * Called once per request when the server reports usage. Only fires
-   * when kawa speaks the `kawiri.v2` subprotocol — older kawa never
-   * emits a metering frame. The event shape mirrors OpenAI's `usage`
-   * block plus our routing identifiers (req_id, model, duration).
-   */
-  onUsage?: (event: UsageEvent) => void;
-  /**
-   * Offer the `kawiri.v2` WebSocket subprotocol on upgrade. When the
-   * server accepts it (`ws.protocol === "kawiri.v2"`), every binary
-   * WS frame carries a one-byte type tag (0x01 encrypted / 0x02
-   * cleartext metering). Default false — explicit opt-in keeps the
-   * legacy path the source of truth for clients that talk directly
-   * to kawa, and only the api.kawiri.ai router insists on v2.
-   */
-  enableV2?: boolean;
 }
-
-export interface UsageEvent {
-  object: "kawiri.usage";
-  req_id?: number;
-  model?: string;
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-  };
-  duration_ms?: number;
-  finish_reason?: string;
-}
-
-// Wire-protocol tags used when the WebSocket subprotocol negotiates
-// `kawiri.v2`. When v1 is in effect (no subprotocol), every frame's
-// payload is the Noise ciphertext directly and these tags don't apply.
-const FRAME_ENCRYPTED = 0x01;
-const FRAME_METERING = 0x02;
-const KAWIRI_V2 = "kawiri.v2";
 
 interface PendingRequest {
   resolve: (value: ChatResult) => void;
@@ -99,14 +63,6 @@ export class KawiriClient {
    * warns were dropped because they flooded devtools without adding signal.
    */
   private isMockConnection = false;
-  /**
-   * True when the server accepted the `kawiri.v2` subprotocol on
-   * upgrade. While true, every binary WS frame carries a leading
-   * byte tag: 0x01 = encrypted Noise payload (existing behavior
-   * shifted by 1 byte), 0x02 = cleartext metering JSON. While false
-   * (old kawa), frames are untagged and metering doesn't exist.
-   */
-  private v2 = false;
 
   constructor(opts: KawiriClientOptions) {
     this.options = {
@@ -116,8 +72,6 @@ export class KawiriClient {
       connectTimeout: opts.connectTimeout ?? 10000,
       debug: opts.debug ?? false,
       onDisconnect: opts.onDisconnect ?? (() => {}),
-      onUsage: opts.onUsage ?? (() => {}),
-      enableV2: opts.enableV2 ?? false,
     };
   }
 
@@ -168,11 +122,7 @@ export class KawiriClient {
         }
       }, this.options.connectTimeout);
 
-      // Offer the v2 subprotocol only when the caller opts in. The
-      // router (api.kawiri.ai) enables this; legacy direct-to-kawa
-      // clients stay on the untagged path so their existing servers
-      // — which know nothing about subprotocols — continue working.
-      const ws = this.options.enableV2 ? new WebSocket(this.options.url, [KAWIRI_V2]) : new WebSocket(this.options.url);
+      const ws = new WebSocket(this.options.url);
       ws.binaryType = "arraybuffer";
       this.ws = ws;
 
@@ -189,16 +139,9 @@ export class KawiriClient {
         try {
           timing.wsOpen = performance.now() - t0;
           dbg(`[kawiri] ws open: ${timing.wsOpen.toFixed(0)}ms`);
-          // Only treat the connection as v2 if we BOTH asked for v2 AND
-          // the server echoed `kawiri.v2`. Belt-and-braces: some
-          // WebSocket runtimes report a non-empty `ws.protocol` even
-          // when the server didn't explicitly negotiate one, which
-          // would otherwise misframe every frame as tagged.
-          this.v2 = (this.options.enableV2 ?? false) && ws.protocol === KAWIRI_V2;
-          dbg(`[kawiri] subprotocol: ${ws.protocol || "(none, v1)"} · v2=${this.v2}`);
           // msg 0: send ephemeral
           const msg0 = await hs.writeMessage();
-          ws.send(wrapOutbound(msg0, this.v2) as Uint8Array<ArrayBuffer>);
+          ws.send(msg0 as Uint8Array<ArrayBuffer>);
           step = 1;
         } catch (err) {
           doSettle(false, err as Error);
@@ -206,15 +149,7 @@ export class KawiriClient {
       };
 
       ws.onmessage = async (event: MessageEvent) => {
-        const raw = new Uint8Array(event.data as ArrayBuffer);
-        // Demux the v2 frame-type tag here so the rest of the receive
-        // pipeline is untouched. Metering frames (0x02) skip the queue
-        // entirely; they're plaintext and have nothing to do with the
-        // Noise transport. Encrypted frames (0x01) get the tag stripped
-        // and flow on as if v1.
-        const payload = this.v2 ? this.handleTaggedFrame(raw) : raw;
-        if (!payload) return; // was metering; consumed by handler
-        msgQueue.push(payload);
+        msgQueue.push(new Uint8Array(event.data as ArrayBuffer));
         if (processing) return;
         processing = true;
         try {
@@ -261,7 +196,7 @@ export class KawiriClient {
             // msg 2: send our static + split
             const tMsg2 = performance.now();
             const msg2 = await hs.writeMessage();
-            ws.send(wrapOutbound(msg2, this.v2) as Uint8Array<ArrayBuffer>);
+            ws.send(msg2 as Uint8Array<ArrayBuffer>);
             this.transport = await hs.split();
             timing.noiseMsg2 = performance.now() - tMsg2;
             dbg(`[kawiri] msg2 (noise write + split): ${timing.noiseMsg2.toFixed(0)}ms`);
@@ -272,8 +207,7 @@ export class KawiriClient {
               const tXwing = performance.now();
               const send = async (d: Uint8Array) => {
                 const ct = await this.transport?.encrypt(d);
-                if (!ct) return;
-                ws.send(wrapOutbound(ct, this.v2) as Uint8Array<ArrayBuffer>);
+                ws.send(ct as Uint8Array<ArrayBuffer>);
               };
               const _receive = () =>
                 new Promise<Uint8Array>((resolve) => {
@@ -345,38 +279,6 @@ export class KawiriClient {
         }
       };
     });
-  }
-
-  /**
-   * Demux a v2-tagged inbound WS frame.
-   * Returns the encrypted Noise payload (tag stripped) for the caller
-   * to feed into the existing handshake/transport pipeline, or null
-   * when the frame was a metering envelope and has been consumed here.
-   */
-  private handleTaggedFrame(raw: Uint8Array): Uint8Array | null {
-    if (raw.length === 0) return raw;
-    const tag = raw[0];
-    if (tag === FRAME_METERING) {
-      // Cleartext JSON usage envelope from kawa. Hand it to the caller
-      // via the onUsage hook; never decrypt, never queue.
-      try {
-        const body = new TextDecoder().decode(raw.subarray(1));
-        const event = JSON.parse(body) as UsageEvent;
-        this.options.onUsage(event);
-      } catch (e) {
-        console.warn("[kawiri] dropped malformed metering frame", e);
-      }
-      return null;
-    }
-    if (tag !== FRAME_ENCRYPTED) {
-      // Unknown tag — neither a Noise frame nor a metering one. Old
-      // servers shouldn't emit anything tagged at all; new ones only
-      // emit 0x01 or 0x02. Drop with a warning to surface protocol
-      // drift if it ever happens.
-      console.warn(`[kawiri] dropped frame with unknown tag 0x${tag.toString(16)}`);
-      return null;
-    }
-    return raw.subarray(1);
   }
 
   private async handleTransportMessage(data: Uint8Array): Promise<void> {
@@ -509,7 +411,7 @@ export class KawiriClient {
     const frames = Framer.encode(data);
     for (const frame of frames) {
       const encrypted = await this.transport.encrypt(frame);
-      this.ws.send(wrapOutbound(encrypted, this.v2) as Uint8Array<ArrayBuffer>);
+      this.ws.send(encrypted as Uint8Array<ArrayBuffer>);
     }
   }
 
@@ -569,17 +471,4 @@ export class KawiriClient {
     }
     this._connected = false;
   }
-}
-
-/**
- * Tag an outbound frame with the v2 encrypted-tag byte (0x01).
- * When v2 isn't in effect, the frame goes out as-is (legacy untagged).
- * Lives outside the class so it's trivial to test in isolation.
- */
-function wrapOutbound(payload: Uint8Array, v2: boolean): Uint8Array {
-  if (!v2) return payload;
-  const out = new Uint8Array(payload.length + 1);
-  out[0] = FRAME_ENCRYPTED;
-  out.set(payload, 1);
-  return out;
 }
