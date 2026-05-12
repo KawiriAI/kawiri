@@ -18,35 +18,12 @@ use tracing::{debug, info, warn};
 /// Prevents resource exhaustion from connection floods.
 const MAX_CONCURRENT_HANDSHAKES: usize = 50;
 
-/// Wire format for every server→client binary WebSocket frame:
-///
-/// ```text
-///   [u32 little-endian: data_len]
-///   [data_len bytes: encrypted Noise payload (may be zero-length)]
-///   [remaining bytes: optional UTF-8 JSON `meta` envelope, router-readable]
-/// ```
-///
-/// Cases the router has to handle:
-///   data populated, meta empty  → ordinary encrypted chunk
-///   data populated, meta JSON   → encrypted chunk + per-chunk meta
-///                                  (e.g. `{"tokens":1}` for live token ticks)
-///   data empty,    meta JSON    → pure-meta frame, typically at end of request
-///                                  carrying `{"usage":{…},"finish_reason":…}`
-///
-/// The router parses the envelope, logs/forwards meta as needed, then sends
-/// ONLY the `data` portion onward to the browser as a raw WS frame — so the
-/// client side speaks today's untagged-Noise protocol untouched.
-///
-/// Client→server direction stays untouched (raw Noise bytes); we never need
-/// the client to add meta and the router has nothing to demux that way.
-fn wrap_frame(data: &[u8], meta: Option<&[u8]>) -> Vec<u8> {
-    let meta_bytes = meta.unwrap_or(&[]);
-    let mut buf = Vec::with_capacity(4 + data.len() + meta_bytes.len());
-    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    buf.extend_from_slice(data);
-    buf.extend_from_slice(meta_bytes);
-    buf
-}
+// Wire format for the kawa WebSocket is bare Noise bytes both ways.
+// Earlier versions wrapped server→client frames in a router-readable
+// `[u32 LE data_len][data][meta]` envelope so CF could peek metering.
+// That meter-tap path moved to a vsock side channel in v0.3.0 (see
+// `stats::send_to_teehost`), and the envelope was dead weight on the
+// hot path — removed.
 
 // ── TDX v4 quote layout (Intel TDX DCAP Quote Generation §A.3.1) ────────────
 //   48-byte header, then 584-byte TD Report body.
@@ -250,12 +227,10 @@ async fn handle_websocket(
     let attestation = tee::generate_attestation(keypair.public_key(), tee_mode).await?;
     let attestation_json = serde_json::to_vec(&attestation)?;
 
-    // msg 1: send ephemeral + static + attestation. Wrapped in the
-    // length-prefixed envelope like every other outbound frame.
+    // msg 1: send ephemeral + static + attestation. Raw Noise bytes;
+    // bare WebSocket frame.
     let msg1 = responder.write_msg1(&attestation_json)?;
-    ws_sink
-        .send(Message::binary(wrap_frame(&msg1, None)))
-        .await?;
+    ws_sink.send(Message::binary(msg1)).await?;
 
     // msg 2: read client static
     let msg2: Vec<u8> = recv_binary!(ws_stream)?;
@@ -330,7 +305,7 @@ async fn handle_websocket(
                     req.path
                 ))),
             };
-            send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk, None).await?;
+            send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
             continue;
         }
 
@@ -396,27 +371,21 @@ async fn handle_websocket(
                     if is_stream {
                         // Parse the chunk so stats.rs can extract counts
                         // (typed, content-free). The parsed `data` is
-                        // used purely as a heuristic input + then dropped
-                        // — it's never serialized externally.
-                        let parsed = serde_json::from_str::<serde_json::Value>(&data).ok();
-                        let chunk_meta_bytes = parsed.as_ref().and_then(|p| {
-                            acc.ingest_chunk(p);
-                            stats::chunk_meta_for(req_id, p)
-                                .and_then(|cm| serde_json::to_vec(&cm).ok())
-                        });
+                        // used purely to accumulate stats for the
+                        // end-of-request record and then dropped — it's
+                        // never serialized externally.
+                        if let Ok(parsed) =
+                            serde_json::from_str::<serde_json::Value>(&data)
+                        {
+                            acc.ingest_chunk(&parsed);
+                        }
 
                         let chunk = KawiriStreamChunk {
                             id: req_id,
                             event: "data".into(),
                             data: Some(serde_json::Value::String(data)),
                         };
-                        send_encrypted_chunk(
-                            transport.as_mut(),
-                            &mut ws_sink,
-                            &chunk,
-                            chunk_meta_bytes.as_deref(),
-                        )
-                        .await?;
+                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
                     } else {
                         // Renamed from `body` to avoid shadowing the
                         // outer request `body` and to make the read of
@@ -439,7 +408,7 @@ async fn handle_websocket(
                             event: "done".into(),
                             data: None,
                         };
-                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk, None)
+                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk)
                             .await?;
                     }
                 }
@@ -450,7 +419,7 @@ async fn handle_websocket(
                         event: "error".into(),
                         data: Some(serde_json::Value::String(msg)),
                     };
-                    send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk, None).await?;
+                    send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
                 }
             }
         }
@@ -460,23 +429,16 @@ async fn handle_websocket(
         // system (counts + closed-set strings only). serde::Serialize
         // is the only way it leaves kawa; an auditor can verify the
         // shape entirely from stats.rs.
-        let meta = acc.finalize();
-
+        //
         // Fire-and-forget the vsock push to teehost. Stats are
         // best-effort observability; a slow or unreachable teehost
-        // must not delay the user-facing response. The owned clone
-        // is needed for the detached task.
-        let stats_for_teehost = meta.clone();
+        // must not delay the user-facing response.
+        let stats_event = acc.finalize();
         tokio::spawn(async move {
-            if let Err(e) = stats::send_to_teehost(&stats_for_teehost).await {
+            if let Err(e) = stats::send_to_teehost(&stats_event).await {
                 debug!(error = %e, "stats vsock push failed");
             }
         });
-
-        // In-stream emission stays on the user-facing WS path.
-        if let Err(e) = send_meta_only(&mut ws_sink, &meta).await {
-            warn!(error = %e, "failed to send end-of-stream meta envelope");
-        }
     }
 
     info!("connection closed");
@@ -507,9 +469,7 @@ where
     };
     let msg1_json = serde_json::to_vec(&msg1)?;
     let encrypted = transport.encrypt(&msg1_json)?;
-    ws_sink
-        .send(Message::binary(wrap_frame(&encrypted, None)))
-        .await?;
+    ws_sink.send(Message::binary(encrypted)).await?;
 
     // Receive ciphertext
     let raw = loop {
@@ -556,66 +516,37 @@ where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
     let bytes = serde_json::to_vec(resp)?;
-    send_encrypted_bytes(transport, ws_sink, &bytes, None).await
+    send_encrypted_bytes(transport, ws_sink, &bytes).await
 }
 
-/// Encrypt and send a serializable stream chunk over WebSocket. If
-/// `meta` is provided, it is attached to the FIRST wire frame
-/// produced from this chunk (subsequent wire frames carry no meta).
-/// The meta bytes are router-readable cleartext JSON — see stats.rs
-/// for what is allowed to appear there.
+/// Encrypt and send a serializable stream chunk over WebSocket.
 async fn send_encrypted_chunk<S>(
     transport: &mut dyn EncryptedTransport,
     ws_sink: &mut S,
     chunk: &KawiriStreamChunk,
-    meta: Option<&[u8]>,
 ) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
     let bytes = serde_json::to_vec(chunk)?;
-    send_encrypted_bytes(transport, ws_sink, &bytes, meta).await
+    send_encrypted_bytes(transport, ws_sink, &bytes).await
 }
 
-/// Encrypt, frame, and send raw bytes over WebSocket. Optional meta
-/// is attached to the first wire frame only — the router gets the
-/// running token count as soon as the chunk starts, instead of
-/// waiting for a large chunk's tail.
+/// Encrypt, frame, and send raw bytes over WebSocket. Bare Noise on
+/// the wire — every cleartext metadata path (billing/quota) now flows
+/// out-of-band over vsock; see `stats::send_to_teehost`.
 async fn send_encrypted_bytes<S>(
     transport: &mut dyn EncryptedTransport,
     ws_sink: &mut S,
     data: &[u8],
-    meta: Option<&[u8]>,
 ) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
-    let frames = framer::encode(data);
-    for (i, frame) in frames.into_iter().enumerate() {
+    for frame in framer::encode(data) {
         let encrypted = transport.encrypt(&frame)?;
-        let frame_meta = if i == 0 { meta } else { None };
-        ws_sink
-            .send(Message::binary(wrap_frame(&encrypted, frame_meta)))
-            .await?;
+        ws_sink.send(Message::binary(encrypted)).await?;
     }
-    Ok(())
-}
-
-/// Send a pure-meta envelope (no `data`, just JSON in the meta
-/// slot). Used once per request at end-of-stream. The router treats
-/// an empty `data` as "nothing to forward to the browser" and only
-/// consumes the meta.
-///
-/// Takes a typed `stats::Stats` so the serialized bytes are
-/// structurally constrained — see stats.rs for the privacy story.
-async fn send_meta_only<S>(ws_sink: &mut S, meta: &stats::Stats) -> anyhow::Result<()>
-where
-    S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
-{
-    let meta_bytes = serde_json::to_vec(meta)?;
-    ws_sink
-        .send(Message::binary(wrap_frame(&[], Some(&meta_bytes))))
-        .await?;
     Ok(())
 }
 
@@ -636,14 +567,14 @@ where
                 "choices": [{"delta": {"content": "Hello from kawa standalone"}}]
             })),
         };
-        send_encrypted_chunk(transport, ws_sink, &chunk, None).await?;
+        send_encrypted_chunk(transport, ws_sink, &chunk).await?;
 
         let done = KawiriStreamChunk {
             id: req.id,
             event: "done".into(),
             data: None,
         };
-        send_encrypted_chunk(transport, ws_sink, &done, None).await?;
+        send_encrypted_chunk(transport, ws_sink, &done).await?;
     } else {
         let resp = KawiriResponse {
             id: req.id,

@@ -104,31 +104,6 @@ pub struct Stats {
     pub error_kind: Option<&'static str>,
 }
 
-/// Per-chunk in-stream envelope. Sent alongside a streaming response
-/// chunk over the encrypted WS (the wire envelope's `data` slot
-/// carries the encrypted chunk, the `meta` slot carries this).
-///
-/// Exactly one of `delta_bytes` or `usage` is set, never both:
-/// - `usage` — authoritative running counts from the engine.
-/// - `delta_bytes` — UTF-8 byte length of new content added by this
-///   chunk; coarse progress only, **not a token count**.
-///
-/// Distinct from [`Stats`]: [`ChunkMeta`] is per-chunk live progress;
-/// [`Stats`] is the per-request authoritative summary at end-of-stream.
-#[derive(Debug, serde::Serialize)]
-pub struct ChunkMeta {
-    /// Schema discriminator — always `"kawiri.chunk"`.
-    pub object: &'static str,
-    /// Request id this chunk belongs to.
-    pub req_id: u64,
-    /// UTF-8 byte count of new model output in this chunk.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_bytes: Option<u32>,
-    /// Authoritative running counts from upstream.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<UsageCounts>,
-}
-
 /// Engine-specific stats, tagged by engine kind. All variants hold
 /// numeric-only fields — a strict structural guarantee that engine
 /// strings (model names, internal status, etc.) can't accidentally
@@ -291,53 +266,6 @@ impl StatsBuilder {
             error_kind: self.error_kind,
         }
     }
-}
-
-/// Build the per-chunk in-stream meta envelope for a streaming response
-/// chunk. Returns `None` when the chunk has nothing worth metering.
-///
-/// Decision order:
-///   1. If the chunk has a `usage` block, pass it through authoritatively.
-///   2. Otherwise, if the chunk extends model output, report the UTF-8
-///      byte length of the new content as a coarse progress signal.
-///   3. Otherwise, return `None`.
-pub fn chunk_meta_for(req_id: u64, parsed: &serde_json::Value) -> Option<ChunkMeta> {
-    if let Some(u) = extract_usage(parsed) {
-        return Some(ChunkMeta {
-            object: "kawiri.chunk",
-            req_id,
-            delta_bytes: None,
-            usage: Some(u),
-        });
-    }
-    let bytes = delta_bytes_for(parsed);
-    if bytes > 0 {
-        return Some(ChunkMeta {
-            object: "kawiri.chunk",
-            req_id,
-            delta_bytes: Some(bytes),
-            usage: None,
-        });
-    }
-    None
-}
-
-/// Sum the UTF-8 byte length of `delta.content` and
-/// `delta.reasoning_content`. Reads strings only to measure their
-/// length — the bytes are never copied out.
-fn delta_bytes_for(parsed: &serde_json::Value) -> u32 {
-    let delta = parsed
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("delta"));
-    let mut total: u32 = 0;
-    for field in ["content", "reasoning_content"] {
-        if let Some(s) = delta.and_then(|d| d.get(field)).and_then(|v| v.as_str()) {
-            let len = u32::try_from(s.len()).unwrap_or(u32::MAX);
-            total = total.saturating_add(len);
-        }
-    }
-    total
 }
 
 /// Pull the `usage` block out of a parsed value (chunk or full response
@@ -598,78 +526,22 @@ mod tests {
     }
 
     #[test]
-    fn delta_content_strings_never_appear_in_chunk_meta() {
+    fn delta_content_strings_never_appear_in_stats() {
+        // Stats accumulator should never copy `delta.content` anywhere
+        // into its emitted record — only counts derived through the
+        // `usage` block are allowed through.
         let secret = "MY_SECRET_API_KEY_sk-abc123def456";
-        let chunk = serde_json::json!({
+        let mut acc = StatsBuilder::new(7, Some("qwen3".into()));
+        acc.ingest_chunk(&serde_json::json!({
             "choices": [{ "delta": {"content": secret} }]
-        });
-        let cm = chunk_meta_for(7, &chunk).unwrap();
-        let serialized = serde_json::to_string(&cm).unwrap();
+        }));
+        let s = acc.finalize();
+        let serialized = serde_json::to_string(&s).unwrap();
         assert!(!serialized.contains("MY_SECRET"));
         assert!(!serialized.contains("sk-"));
-        assert_eq!(cm.delta_bytes, Some(secret.len() as u32));
-        assert!(cm.usage.is_none());
-        assert_eq!(cm.req_id, 7);
-        assert_eq!(cm.object, "kawiri.chunk");
-    }
-
-    #[test]
-    fn authoritative_usage_takes_priority_over_heuristic() {
-        let chunk = serde_json::json!({
-            "choices": [{"delta": {"content": "hello"}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
-        });
-        let cm = chunk_meta_for(99, &chunk).unwrap();
-        assert!(cm.delta_bytes.is_none(), "should defer to authoritative");
-        let u = cm.usage.unwrap();
-        assert_eq!(u.prompt_tokens, Some(5));
-        assert_eq!(u.completion_tokens, Some(1));
-        assert_eq!(cm.req_id, 99);
-    }
-
-    #[test]
-    fn empty_delta_emits_nothing() {
-        assert!(chunk_meta_for(1, &serde_json::json!({})).is_none());
-        assert!(chunk_meta_for(
-            1,
-            &serde_json::json!({"choices":[{"delta":{"role":"assistant"}}]})
-        )
-        .is_none());
-        assert!(chunk_meta_for(
-            1,
-            &serde_json::json!({"choices":[{"delta":{"content":""}}]})
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn reasoning_content_counts_too() {
-        let chunk = serde_json::json!({
-            "choices": [{"delta": {"reasoning_content": "thinking..."}}]
-        });
-        let cm = chunk_meta_for(1, &chunk).unwrap();
-        assert_eq!(cm.delta_bytes, Some("thinking...".len() as u32));
-    }
-
-    #[test]
-    fn delta_bytes_sums_content_and_reasoning() {
-        let chunk = serde_json::json!({
-            "choices": [{"delta": {
-                "content": "abc",
-                "reasoning_content": "wxyz",
-            }}]
-        });
-        let cm = chunk_meta_for(1, &chunk).unwrap();
-        assert_eq!(cm.delta_bytes, Some(3 + 4));
-    }
-
-    #[test]
-    fn delta_bytes_counts_utf8_bytes_not_codepoints() {
-        let s = "héllo🎉"; // 1 + 2 + 3*1 + 4 = 10 bytes
-        assert_eq!(s.len(), 10);
-        let chunk = serde_json::json!({"choices":[{"delta":{"content": s}}]});
-        let cm = chunk_meta_for(1, &chunk).unwrap();
-        assert_eq!(cm.delta_bytes, Some(10));
+        // No usage block was provided, so `usage` stays None — content
+        // bytes are simply not part of the privacy boundary's output.
+        assert!(s.usage.is_none());
     }
 
     #[test]
