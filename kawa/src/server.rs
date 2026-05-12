@@ -168,6 +168,17 @@ async fn handle_request(
             .body(Full::new("Expected WebSocket".into()))?);
     }
 
+    // Capture the router-supplied connection id (if any) BEFORE the
+    // upgrade consumes the request. Opaque to kawa — just echoed back
+    // in every stats event so teehost can resolve it to a billing
+    // principal via its conn_map. Absent for direct/dev connections
+    // that haven't been through the router.
+    let conn_id = req
+        .headers()
+        .get("x-kawiri-conn-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
 
     tokio::spawn(async move {
@@ -180,7 +191,9 @@ async fn handle_request(
             }
         };
 
-        if let Err(e) = handle_websocket(websocket, config, keypair, http_client, tee_mode).await {
+        if let Err(e) =
+            handle_websocket(websocket, config, keypair, http_client, tee_mode, conn_id).await
+        {
             warn!(error = %e, "websocket handler error");
         }
     });
@@ -194,6 +207,7 @@ async fn handle_websocket(
     keypair: Arc<StaticKeypair>,
     http_client: Arc<reqwest::Client>,
     tee_mode: TeeMode,
+    conn_id: Option<String>,
 ) -> anyhow::Result<()> {
     let ws = websocket.await?;
     let (mut ws_sink, mut ws_stream) = ws.split();
@@ -326,7 +340,7 @@ async fn handle_websocket(
             .and_then(|b| b.get("model"))
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
-        let mut acc = StatsBuilder::new(req_id, req_model);
+        let mut acc = StatsBuilder::new(req_id, req_model).with_conn_id(conn_id.clone());
 
         // Mutate the outgoing body to enable per-chunk and final-chunk
         // usage reporting from whichever inference engine is upstream.
@@ -374,9 +388,7 @@ async fn handle_websocket(
                         // used purely to accumulate stats for the
                         // end-of-request record and then dropped — it's
                         // never serialized externally.
-                        if let Ok(parsed) =
-                            serde_json::from_str::<serde_json::Value>(&data)
-                        {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
                             acc.ingest_chunk(&parsed);
                         }
 
@@ -408,8 +420,7 @@ async fn handle_websocket(
                             event: "done".into(),
                             data: None,
                         };
-                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk)
-                            .await?;
+                        send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
                     }
                 }
                 ProxyEvent::Error(msg) => {

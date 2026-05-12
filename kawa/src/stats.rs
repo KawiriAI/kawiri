@@ -72,6 +72,13 @@ pub struct Stats {
     pub object: &'static str,
     /// Schema generation. Bump on any incompatible field change.
     pub schema_version: u32,
+    /// Connection identifier minted by the router and forwarded
+    /// through teehost via the `X-Kawiri-Conn-Id` header on the WS
+    /// upgrade. Kawa is opaque to it — just echoes back so teehost
+    /// can look up the (user_id, token_id) without trusting kawa
+    /// to know them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn_id: Option<String>,
     /// Caller's request id. Just a number; downstream uses it to
     /// correlate billing rows.
     pub req_id: u64,
@@ -167,6 +174,7 @@ pub const ERROR_KINDS: &[&str] = &["context_overflow", "timeout", "upstream_erro
 pub struct StatsBuilder {
     req_id: u64,
     model: Option<String>,
+    conn_id: Option<String>,
     started_at_ms: u64,
     started: Instant,
     usage: Option<UsageCounts>,
@@ -184,6 +192,7 @@ impl StatsBuilder {
         Self {
             req_id,
             model,
+            conn_id: None,
             started_at_ms,
             started: Instant::now(),
             usage: None,
@@ -191,6 +200,14 @@ impl StatsBuilder {
             finish_reason: None,
             error_kind: None,
         }
+    }
+
+    /// Attach the connection identifier received off the WS upgrade
+    /// (`X-Kawiri-Conn-Id`). Echoed back in stats so teehost can
+    /// resolve the request to a billing principal.
+    pub fn with_conn_id(mut self, conn_id: Option<String>) -> Self {
+        self.conn_id = conn_id;
+        self
     }
 
     /// Read counts and the whitelisted `finish_reason` out of a parsed
@@ -251,6 +268,7 @@ impl StatsBuilder {
         Stats {
             object: "kawiri.stats",
             schema_version: 1,
+            conn_id: self.conn_id,
             req_id: self.req_id,
             started_at_ms: self.started_at_ms,
             duration_ms: self.started.elapsed().as_millis() as u64,
