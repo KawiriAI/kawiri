@@ -68,12 +68,12 @@ const SNP_HOST_DATA: usize = 0xc0; // 32 bytes
 const SNP_MIN_LEN: usize = 0xe0; // through end of hostData
 
 use crate::config::Config;
-use crate::meter::{self, Accumulator};
 use crate::protocol::framer::{self, FrameAssembler};
 use crate::protocol::noise::{NoiseResponder, StaticKeypair};
 use crate::protocol::transport::EncryptedTransport;
 use crate::protocol::types::{KawiriRequest, KawiriResponse, KawiriStreamChunk};
 use crate::proxy::{self, ProxyEvent};
+use crate::stats::{self, StatsBuilder};
 use crate::tee::{self, TeeMode};
 
 pub async fn start_server(config: Config, tee_mode: TeeMode) -> anyhow::Result<()> {
@@ -342,7 +342,7 @@ async fn handle_websocket(
 
         // Build the per-request metering accumulator. From here on,
         // EVERYTHING that ends up in the meta envelope flows through
-        // `acc` — typed, count-only, content-free. See `meter.rs` for
+        // `acc` — typed, count-only, content-free. See `stats.rs` for
         // the privacy invariants.
         let req_id = req.id;
         let req_model = req
@@ -351,13 +351,13 @@ async fn handle_websocket(
             .and_then(|b| b.get("model"))
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
-        let mut acc = Accumulator::new(req_id, req_model);
+        let mut acc = StatsBuilder::new(req_id, req_model);
 
         // Mutate the outgoing body to enable per-chunk and final-chunk
         // usage reporting from whichever inference engine is upstream.
         // This is a metadata-only mutation (it only touches the
         // `stream_options` field); user prompt content in `messages`
-        // is untouched. See `meter::inject_usage_flags`.
+        // is untouched. See `stats::inject_usage_flags`.
         //
         // Gated on chat-completions paths because `stream_options` is
         // chat-completions-specific in the OpenAI spec — injecting it
@@ -366,7 +366,7 @@ async fn handle_websocket(
         let mut body = req.body.clone();
         if req.path.ends_with("/chat/completions") {
             if let Some(b) = body.as_mut() {
-                meter::inject_usage_flags(b);
+                stats::inject_usage_flags(b);
             }
         }
 
@@ -394,14 +394,14 @@ async fn handle_websocket(
             match event {
                 ProxyEvent::Chunk(data) => {
                     if is_stream {
-                        // Parse the chunk so meter.rs can extract counts
+                        // Parse the chunk so stats.rs can extract counts
                         // (typed, content-free). The parsed `data` is
                         // used purely as a heuristic input + then dropped
                         // — it's never serialized externally.
                         let parsed = serde_json::from_str::<serde_json::Value>(&data).ok();
                         let chunk_meta_bytes = parsed.as_ref().and_then(|p| {
                             acc.ingest_chunk(p);
-                            meter::chunk_meta_for(req_id, p)
+                            stats::chunk_meta_for(req_id, p)
                                 .and_then(|cm| serde_json::to_vec(&cm).ok())
                         });
 
@@ -459,7 +459,7 @@ async fn handle_websocket(
         // typed `Meta` whose fields are constrained by the type
         // system (counts + closed-set strings only). serde::Serialize
         // is the only way it leaves kawa; an auditor can verify the
-        // shape entirely from meter.rs.
+        // shape entirely from stats.rs.
         let meta = acc.finalize();
         if let Err(e) = send_meta_only(&mut ws_sink, &meta).await {
             warn!(error = %e, "failed to send end-of-stream meta envelope");
@@ -549,7 +549,7 @@ where
 /// Encrypt and send a serializable stream chunk over WebSocket. If
 /// `meta` is provided, it is attached to the FIRST wire frame
 /// produced from this chunk (subsequent wire frames carry no meta).
-/// The meta bytes are router-readable cleartext JSON — see meter.rs
+/// The meta bytes are router-readable cleartext JSON — see stats.rs
 /// for what is allowed to appear there.
 async fn send_encrypted_chunk<S>(
     transport: &mut dyn EncryptedTransport,
@@ -593,9 +593,9 @@ where
 /// an empty `data` as "nothing to forward to the browser" and only
 /// consumes the meta.
 ///
-/// Takes a typed `meter::Meta` so the serialized bytes are
-/// structurally constrained — see meter.rs for the privacy story.
-async fn send_meta_only<S>(ws_sink: &mut S, meta: &meter::Meta) -> anyhow::Result<()>
+/// Takes a typed `stats::Stats` so the serialized bytes are
+/// structurally constrained — see stats.rs for the privacy story.
+async fn send_meta_only<S>(ws_sink: &mut S, meta: &stats::Stats) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = hyper_tungstenite::tungstenite::Error> + Unpin,
 {
