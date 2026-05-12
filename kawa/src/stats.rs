@@ -66,7 +66,7 @@ pub struct UsageCounts {
 /// Both paths serialize the same JSON; teehost adds `vm_id`,
 /// `image_name`, `host_id`, `user_id`, `token_id`, and `ingested_at_ms`
 /// at ingest time — kawa never emits those fields.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Stats {
     /// Schema discriminator — always `"kawiri.stats"`.
     pub object: &'static str,
@@ -133,7 +133,7 @@ pub struct ChunkMeta {
 /// numeric-only fields — a strict structural guarantee that engine
 /// strings (model names, internal status, etc.) can't accidentally
 /// promote into a Stats envelope.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum EngineStats {
     /// llama.cpp `timings` block, as emitted by llama-server when the
@@ -143,7 +143,7 @@ pub enum EngineStats {
 
 /// Subset of llama.cpp's `timings` block we pass through. Pure numbers
 /// — no strings.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LlamaCppTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predicted_n: Option<u64>,
@@ -422,6 +422,99 @@ pub fn classify_error(message: &str) -> &'static str {
     }
 }
 
+// ── vsock egress to teehost ──────────────────────────────────────────────
+//
+// The second emit path: kawa pushes a finalized Stats record over vsock
+// to teehost for persistence + aggregation. Fire-and-forget — failures
+// degrade observability, never the request itself. Teehost runs the
+// `kawa_stats` listener on the same vsock port as the rest of the
+// kawa↔teehost protocol (see kcvm/tee/vsock_teehost.rs); we add a new
+// message type kind without disturbing the existing PING / GET_SNP_CERTS
+// roundtrips.
+
+mod vsock_wire {
+    //! Constants in lockstep with `teehost/src/kawa_stats/proto.rs`.
+    /// Host CID (every CVM sees the host as 2).
+    pub const HOST_CID: u32 = 2;
+    /// teehost vsock port (shared with the existing kawa↔teehost protocol).
+    pub const TEEHOST_PORT: u32 = 4050;
+    pub const MAJOR_VERSION: u16 = 1;
+    pub const MINOR_VERSION: u16 = 1;
+    pub const HEADER_SIZE: usize = 16;
+    /// New message type for kawa→teehost stats reports. Existing kinds
+    /// (PING_REQ=130, PING_RESP=131, GET_SNP_CERTS_REQ=128,
+    /// GET_SNP_CERTS_RESP=129) stay unchanged.
+    pub const KAWA_STATS_REPORT: u32 = 140;
+}
+
+/// Build a framed `KAWA_STATS_REPORT` packet:
+///   [4-byte BE total_size] [header(16)] [JSON body]
+/// where the header is `[u16 major][u16 minor][u32 msg_type][u32
+/// total_size][u32 error_code=0]` little-endian. Same wire format as
+/// the existing kawa↔teehost protocol.
+fn build_stats_frame(payload: &[u8]) -> Vec<u8> {
+    let total_size = (vsock_wire::HEADER_SIZE + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + total_size as usize);
+    buf.extend_from_slice(&total_size.to_be_bytes());
+    buf.extend_from_slice(&vsock_wire::MAJOR_VERSION.to_le_bytes());
+    buf.extend_from_slice(&vsock_wire::MINOR_VERSION.to_le_bytes());
+    buf.extend_from_slice(&vsock_wire::KAWA_STATS_REPORT.to_le_bytes());
+    buf.extend_from_slice(&total_size.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // error_code
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Errors that can stop a stats push. None of these tear down a
+/// request — the caller is expected to log + carry on.
+#[derive(Debug, thiserror::Error)]
+pub enum StatsSendError {
+    #[error("vsock I/O: {0}")]
+    Io(std::io::Error),
+    #[error("connect or write timed out")]
+    Timeout,
+    #[error("serialize stats: {0}")]
+    Serialize(serde_json::Error),
+}
+
+/// Push one Stats record to teehost via vsock. Fire-and-forget: opens
+/// a connection, writes the framed payload, closes. Never reads a
+/// response (teehost acknowledges by ingesting; loss surfaces as a
+/// gap in the JSONL store, not as a kawa-side error).
+///
+/// Total budget: 2 second timeout on connect + write. Anything slower
+/// and we drop the event rather than block subsequent requests.
+pub async fn send_to_teehost(stats: &Stats) -> Result<(), StatsSendError> {
+    use tokio::io::AsyncWriteExt;
+    use tokio_vsock::{VsockAddr, VsockStream};
+
+    let payload = serde_json::to_vec(stats).map_err(StatsSendError::Serialize)?;
+    let frame = build_stats_frame(&payload);
+
+    let timeout = std::time::Duration::from_secs(2);
+    let mut stream = tokio::time::timeout(
+        timeout,
+        VsockStream::connect(VsockAddr::new(
+            vsock_wire::HOST_CID,
+            vsock_wire::TEEHOST_PORT,
+        )),
+    )
+    .await
+    .map_err(|_| StatsSendError::Timeout)?
+    .map_err(StatsSendError::Io)?;
+
+    tokio::time::timeout(timeout, async {
+        stream.write_all(&frame).await?;
+        stream.flush().await?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|_| StatsSendError::Timeout)?
+    .map_err(StatsSendError::Io)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +791,64 @@ mod tests {
             "choices": [{"delta": {"content": "hi"}}]
         }));
         assert!(acc.finalize().engine.is_none());
+    }
+
+    // ── Vsock framing tests ───────────────────────────────────────
+
+    #[test]
+    fn stats_frame_layout_is_correct() {
+        // Smoke-check the exact byte layout against the documented wire
+        // format: [u32 BE total][u16 LE major][u16 LE minor]
+        //         [u32 LE type][u32 LE total][u32 LE error=0][body…]
+        let body = b"hello";
+        let frame = build_stats_frame(body);
+
+        let expected_total = (vsock_wire::HEADER_SIZE + body.len()) as u32;
+        assert_eq!(
+            &frame[0..4],
+            &expected_total.to_be_bytes(),
+            "BE length prefix"
+        );
+        assert_eq!(
+            &frame[4..6],
+            &vsock_wire::MAJOR_VERSION.to_le_bytes(),
+            "LE major"
+        );
+        assert_eq!(
+            &frame[6..8],
+            &vsock_wire::MINOR_VERSION.to_le_bytes(),
+            "LE minor"
+        );
+        assert_eq!(
+            &frame[8..12],
+            &vsock_wire::KAWA_STATS_REPORT.to_le_bytes(),
+            "LE msg_type"
+        );
+        assert_eq!(
+            &frame[12..16],
+            &expected_total.to_le_bytes(),
+            "LE total_size"
+        );
+        assert_eq!(&frame[16..20], &0u32.to_le_bytes(), "error_code = 0");
+        assert_eq!(&frame[20..], body, "body verbatim");
+        assert_eq!(
+            frame.len(),
+            4 + vsock_wire::HEADER_SIZE + body.len(),
+            "total frame length"
+        );
+    }
+
+    #[test]
+    fn stats_frame_serializes_a_real_stats_record() {
+        let stats = StatsBuilder::new(42, Some("qwen3".into())).finalize();
+        let payload = serde_json::to_vec(&stats).unwrap();
+        let frame = build_stats_frame(&payload);
+        // Round-trip the header back to make sure msg_type made it
+        // through. (We don't need to parse the body here — tests above
+        // cover that side.)
+        let msg_type = u32::from_le_bytes(frame[8..12].try_into().unwrap());
+        assert_eq!(msg_type, 140);
+        // Body starts at offset 20, contains the JSON we serialized.
+        assert_eq!(&frame[20..], payload.as_slice());
     }
 }

@@ -455,12 +455,25 @@ async fn handle_websocket(
             }
         }
 
-        // End-of-request meta envelope. `acc.finalize()` returns a
-        // typed `Meta` whose fields are constrained by the type
+        // End-of-request stats record. `acc.finalize()` returns a
+        // typed `Stats` whose fields are constrained by the type
         // system (counts + closed-set strings only). serde::Serialize
         // is the only way it leaves kawa; an auditor can verify the
         // shape entirely from stats.rs.
         let meta = acc.finalize();
+
+        // Fire-and-forget the vsock push to teehost. Stats are
+        // best-effort observability; a slow or unreachable teehost
+        // must not delay the user-facing response. The owned clone
+        // is needed for the detached task.
+        let stats_for_teehost = meta.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stats::send_to_teehost(&stats_for_teehost).await {
+                debug!(error = %e, "stats vsock push failed");
+            }
+        });
+
+        // In-stream emission stays on the user-facing WS path.
         if let Err(e) = send_meta_only(&mut ws_sink, &meta).await {
             warn!(error = %e, "failed to send end-of-stream meta envelope");
         }
