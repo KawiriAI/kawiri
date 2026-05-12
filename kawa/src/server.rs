@@ -168,16 +168,21 @@ async fn handle_request(
             .body(Full::new("Expected WebSocket".into()))?);
     }
 
-    // Capture the router-supplied connection id (if any) BEFORE the
-    // upgrade consumes the request. Opaque to kawa — just echoed back
-    // in every stats event so teehost can resolve it to a billing
-    // principal via its conn_map. Absent for direct/dev connections
-    // that haven't been through the router.
+    // Capture router-supplied identity + policy headers BEFORE the
+    // upgrade consumes the request. All opaque to kawa: conn_id is
+    // echoed back; limit_tokens_per_ws is enforced locally.
+    // Absent for direct/dev connections that haven't been through
+    // the router — kawa runs without budget caps in that case.
     let conn_id = req
         .headers()
         .get("x-kawiri-conn-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let limit_tokens_per_ws = req
+        .headers()
+        .get("x-kawiri-limit-tokens-per-ws")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
     let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
 
@@ -191,8 +196,16 @@ async fn handle_request(
             }
         };
 
-        if let Err(e) =
-            handle_websocket(websocket, config, keypair, http_client, tee_mode, conn_id).await
+        if let Err(e) = handle_websocket(
+            websocket,
+            config,
+            keypair,
+            http_client,
+            tee_mode,
+            conn_id,
+            limit_tokens_per_ws,
+        )
+        .await
         {
             warn!(error = %e, "websocket handler error");
         }
@@ -208,6 +221,7 @@ async fn handle_websocket(
     http_client: Arc<reqwest::Client>,
     tee_mode: TeeMode,
     conn_id: Option<String>,
+    limit_tokens_per_ws: Option<u64>,
 ) -> anyhow::Result<()> {
     let ws = websocket.await?;
     let (mut ws_sink, mut ws_stream) = ws.split();
@@ -264,8 +278,38 @@ async fn handle_websocket(
 
     // --- Phase 3: Transport message loop ---
     let mut assembler = FrameAssembler::new();
+    // Per-WS budget enforcement. The router caps `limit_tokens_per_ws`
+    // at `remaining_monthly / (active_concurrent + 1)` so worst-case
+    // overshoot across all of a user's WSs is bounded by their plan
+    // quota. When `budget_used` exceeds the cap we emit one final
+    // policy-close stats record and close with 1008 (Policy Violation).
+    let budget_cap: Option<u64> = limit_tokens_per_ws;
+    let mut budget_used: u64 = 0;
 
     loop {
+        // Cheap pre-recv check: if we've already burned the budget, we
+        // never start reading the next request. Stops a slow client
+        // from holding the WS open just past quota.
+        if budget_cap.is_some_and(|cap| budget_used >= cap) {
+            let mut acc = StatsBuilder::new(0, None).with_conn_id(conn_id.clone());
+            acc.ingest_policy_close("ws_budget_exhausted");
+            let stats_event = acc.finalize();
+            tokio::spawn(async move {
+                if let Err(e) = stats::send_to_teehost(&stats_event).await {
+                    debug!(error = %e, "stats vsock push failed");
+                }
+            });
+            let _ = ws_sink
+                .send(Message::Close(Some(
+                    hyper_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: hyper_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                        reason: "ws_budget_exhausted".into(),
+                    },
+                )))
+                .await;
+            break;
+        }
+
         let raw: Vec<u8> = match recv_binary!(ws_stream) {
             Ok(data) => data,
             Err(_) => break,
@@ -445,6 +489,12 @@ async fn handle_websocket(
         // best-effort observability; a slow or unreachable teehost
         // must not delay the user-facing response.
         let stats_event = acc.finalize();
+        // Tally this request's completion tokens against the per-WS
+        // budget BEFORE we ship the stats off, since the move into
+        // the spawn would otherwise consume the value.
+        if let Some(c) = stats_event.usage.as_ref().and_then(|u| u.completion_tokens) {
+            budget_used = budget_used.saturating_add(c);
+        }
         tokio::spawn(async move {
             if let Err(e) = stats::send_to_teehost(&stats_event).await {
                 debug!(error = %e, "stats vsock push failed");

@@ -162,7 +162,15 @@ pub const FINISH_REASONS: &[&str] = &[
 /// discarded. Exposed so an auditor can grep for the complete set of
 /// strings that may appear in `Stats::error_kind`; asserted in tests.
 #[allow(dead_code)]
-pub const ERROR_KINDS: &[&str] = &["context_overflow", "timeout", "upstream_error", "internal"];
+pub const ERROR_KINDS: &[&str] = &[
+    "context_overflow",
+    "timeout",
+    "upstream_error",
+    "internal",
+    "rate_limited",
+    "ws_budget_exhausted",
+    "killed",
+];
 
 /// Per-request accumulator. Builds state as chunks arrive; on finish,
 /// produces the [`Stats`] for the end-of-request record.
@@ -261,6 +269,15 @@ impl StatsBuilder {
     /// return value survives.
     pub fn ingest_error(&mut self, upstream_message: &str) {
         self.error_kind = Some(classify_error(upstream_message));
+    }
+
+    /// Mark this stats record as terminated by a policy decision —
+    /// distinct from an upstream error. Used by the per-WS budget
+    /// enforcement to attribute close events to the right cause.
+    pub fn ingest_policy_close(&mut self, error_kind: &'static str) {
+        if ERROR_KINDS.contains(&error_kind) {
+            self.error_kind = Some(error_kind);
+        }
     }
 
     /// Produce the end-of-request envelope.
