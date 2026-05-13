@@ -84,7 +84,7 @@ pub struct UsageCounts {
 ///   can do billing/quota/audit).
 ///
 /// Both paths serialize the same JSON; teehost adds `vm_id`,
-/// `image_name`, `host_id`, `user_id`, `token_id`, and `ingested_at_ms`
+/// `image_name`, `host_id`, `user_id`, `api_key_id`, and `ingested_at_ms`
 /// at ingest time — kawa never emits those fields.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Stats {
@@ -95,7 +95,7 @@ pub struct Stats {
     /// Connection identifier minted by the router and forwarded
     /// through teehost via the `X-Kawiri-Conn-Id` header on the WS
     /// upgrade. Kawa is opaque to it — just echoes back so teehost
-    /// can look up the (user_id, token_id) without trusting kawa
+    /// can look up the (user_id, api_key_id) without trusting kawa
     /// to know them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conn_id: Option<String>,
