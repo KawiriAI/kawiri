@@ -149,9 +149,6 @@ export class KawiriClient {
       };
 
       ws.onmessage = async (event: MessageEvent) => {
-        // Every server→client frame is bare Noise bytes — kawa v0.3.1
-        // removed the cleartext meta envelope from the wire when the
-        // metering side channel moved fully to vsock.
         const payload = new Uint8Array(event.data as ArrayBuffer);
         if (payload.length === 0) return;
         msgQueue.push(payload);

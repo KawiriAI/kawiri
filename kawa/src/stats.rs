@@ -14,6 +14,26 @@
 //! themselves that no user prompt content and no model output content
 //! can reach any external consumer.
 //!
+//! ## Trust model
+//!
+//! Token counts (`usage.prompt_tokens`, `usage.completion_tokens`)
+//! are reported by kawa based on what the upstream engine returns.
+//! There is **no cross-check** against the engine's wire output and
+//! no independent count by teehost or the router. We treat kawa's
+//! self-report as authoritative because:
+//!
+//!   1. kawa runs inside the attested CVM; its binary measurements
+//!      are part of the SNP/TDX report the client verifies at
+//!      handshake. A compromised kawa would also break attestation.
+//!   2. The engine (llama.cpp / vllm / sglang) is the source of truth
+//!      for token math; double-counting tokens in kawa would be
+//!      expensive and approximate.
+//!
+//! The full trust-boundary table for the stats pipeline lives in
+//! `platform/docs/metering/01-stats-event-schema.md` ("Trust
+//! boundaries"). Operators evaluating quota correctness should
+//! consult both.
+//!
 //! ## What can appear in a Stats record
 //!
 //! - **Counts** (`u32`, `u64`) — number of tokens, number of bytes,

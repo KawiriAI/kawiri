@@ -178,11 +178,18 @@ async fn handle_request(
         .get("x-kawiri-conn-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // Per-WS token cap stamped by the router. Clamped to a sane
+    // ceiling (10M tokens) so a header injection / misconfig that
+    // sets u64::MAX can't silently disable budget enforcement.
+    // `0` is interpreted by `handle_websocket` as "no cap" — see
+    // `budget_cap` derivation downstream.
+    const LIMIT_TOKENS_CEILING: u64 = 10_000_000;
     let limit_tokens_per_ws = req
         .headers()
         .get("x-kawiri-limit-tokens-per-ws")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|n| n.min(LIMIT_TOKENS_CEILING));
 
     let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
 
@@ -342,6 +349,29 @@ async fn handle_websocket(
             .and_then(|b| b.get("stream"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // Inline budget check: refuse a request whose stated
+        // `max_tokens` would push us past the cap before it even
+        // hits the engine. Without this, a single huge completion
+        // can overshoot the cap by its entire size — the pre-recv
+        // guard above only fires AFTER the request that blew the
+        // budget has already streamed. Pure logic lives in
+        // `crate::budget` for unit tests.
+        if let crate::budget::BudgetVerdict::Reject {
+            requested,
+            remaining,
+        } = crate::budget::check_budget(req.body.as_ref(), budget_cap, budget_used)
+        {
+            let chunk = KawiriStreamChunk {
+                id: req.id,
+                event: "error".into(),
+                data: Some(serde_json::Value::String(format!(
+                    "ws_budget_exhausted: requested max_tokens={requested} > remaining={remaining}"
+                ))),
+            };
+            send_encrypted_chunk(transport.as_mut(), &mut ws_sink, &chunk).await?;
+            continue;
+        }
 
         // Handle request
         if req.path == "/ping" {
