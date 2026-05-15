@@ -1,6 +1,6 @@
 # @kawiri/konnect
 
-TypeScript client for Kawiri's encrypted+attested inference tunnel. Works in browsers (Bun, modern WebKit/Chromium/Firefox) and from a CLI (Bun/Node).
+TypeScript client for Kawiri's encrypted+attested inference tunnel. Works in browsers (modern WebKit/Chromium/Firefox) and from a CLI (Bun/Node). Ships a `konnect` binary that runs an OpenAI-compatible local proxy in front of the tunnel.
 
 ## Library
 
@@ -21,23 +21,38 @@ const stream = client.chatStream(
 for await (const token of stream) console.write(token);
 ```
 
-## CLI
+For non-chat endpoints (embeddings, completions, /v1/models, /ping), use `client.requestRaw()` to get the upstream JSON verbatim:
 
-`konnect serve` runs an **OpenAI-compatible local proxy** in front of the tunnel — any tool that speaks plain OpenAI HTTP (OpenWebUI, Continue, Cursor, llm-cli, LM Studio, …) points at `http://127.0.0.1:8090` and gets Kawiri E2E encryption + attestation underneath without speaking the WS protocol itself.
+```ts
+const resp = await client.requestRaw("POST", "/v1/embeddings", {
+  model: "qwen3-0.6b-…",
+  input: ["hello world"],
+});
+console.log(resp.status, resp.body);
+```
+
+`client.request()` is still available but reshapes responses into a chat-shaped `ChatResult` — fine for chat endpoints, lossy for everything else.
+
+## CLI — `konnect serve`
+
+Runs an **OpenAI-compatible local proxy** in front of the tunnel. Any tool that speaks plain OpenAI HTTP (OpenWebUI, Continue, Cursor, llm-cli, LM Studio, …) points at `http://127.0.0.1:8090` and gets Kawiri E2E encryption + attestation underneath without speaking the WS protocol itself.
 
 ```
-                                       konnect serve
-local tool                             ┌────────────────┐
-(OpenAI HTTP) ─── localhost:8090 ────▶ │  HTTP server   │
-                                       │  ↕ translate   │
-                                       │  Noise / X-Wing│
-                                       └────────┬───────┘
-                                                │
-                                                ▼
-                                  wss://api.kawiri.ai/v1/chat
-                                                │
-                                                ▼
-                                       teehost ──▶ kawa ──▶ llama.cpp / vLLM
+                                              konnect serve
+local tool                                    ┌──────────────────────────┐
+(OpenAI HTTP) ── localhost:8090 ────────────▶ │  HTTP server             │
+                                              │  ↕ translate             │
+                                              │  ClientPool              │
+                                              │   • image A → WS         │
+                                              │   • image B → WS         │
+                                              │   • image C → WS         │
+                                              └──────────┬───────────────┘
+                                                         │
+                                  wss://api.kawiri.ai/v1/chat?model=<image>
+                                  (Authorization: Bearer kw_…)
+                                                         │
+                                                         ▼
+                                          teehost ──▶ kawa ──▶ engine
 ```
 
 ### Quick start
@@ -46,10 +61,20 @@ local tool                             ┌────────────�
 bun install -g @kawiri/konnect
 
 # minimum: api_key + which kcvm image to route to
-KAWIRI_API_KEY=kw_xxx konnect serve --model qwen3-0.6b-q4-llamacpp-cpu_0.1.1
+KAWIRI_API_KEY=kw_xxx konnect serve --models qwen3-0.6b-q4-llamacpp-cpu_0.1.1
 ```
 
 …then point your tool at `http://127.0.0.1:8090` and the OpenAI API base path `/v1`.
+
+### Multi-model
+
+One `konnect serve` process can hold N WS connections, one per kcvm image, sharing the same bearer:
+
+```
+konnect serve --models qwen3-0.6b-…,qwen3-1.7b-…,qwen3-4b-…
+```
+
+The first image in the list is the default-when-omitted. Each image gets its own attested handshake on first use, idle-evicts after a configurable window, and re-opens automatically on next request. A bad image doesn't affect the others.
 
 ### Config file
 
@@ -63,7 +88,7 @@ See [`cli/example-config.toml`](cli/example-config.toml) for the full surface.
 
 ### API key resolution order
 
-Flag > env var > config file. Pick one:
+CLI flag > env var > config file. Pick one:
 
 | Source | How |
 |---|---|
@@ -76,29 +101,42 @@ Flag > env var > config file. Pick one:
 | Route | Behavior |
 |---|---|
 | `GET /healthz` | Liveness, doesn't require tunnel |
-| `GET /readyz` | 200 only when the tunnel is attested + connected |
-| `GET /v1/models` | Synthesized: the configured model + every alias |
+| `GET /readyz` | 200 + JSON stats only when at least one tunnel is attested + connected |
+| `GET /v1/models` | Synthesized: the configured images + every alias |
 | `POST /v1/chat/completions` | Streaming SSE if `stream: true`, single JSON otherwise |
-| `POST /v1/completions` | Generic passthrough |
-| `POST /v1/embeddings` | Generic passthrough |
-| `*/v1/*` | Generic passthrough — anything the engine inside the CVM supports works without per-route code |
+| `*` under `/v1/*` | Generic passthrough — body and status replayed verbatim from the engine. Embeddings, completions, audio, images, anything the kcvm engine serves works without per-route code |
 
 ### Model aliases
 
 If your tool hardcodes a model name like `gpt-4o-mini`, set an alias:
 
 ```toml
+models = ["qwen3-0.6b-q4-llamacpp-cpu_0.1.1"]
+
 [aliases]
 "gpt-4o-mini" = "qwen3-0.6b-q4-llamacpp-cpu_0.1.1"
 ```
 
-`/v1/models` then advertises both names; requests for either route to the configured image.
+Every alias target must appear in `models` — the proxy validates this on startup.
 
 ### Security notes
 
-- The proxy is bound to `127.0.0.1` by default. Don't bind it to a public interface without also setting `[security].local_token`.
+- The proxy is bound to `127.0.0.1` by default. Don't bind it to a public interface without also setting `[security].local_token`. The token is compared in constant time.
 - `allow_mock_attestation = true` accepts kawa instances running with the `mock` cargo feature. **Dev only.** Production deployments must leave it off so the real TEE quote is verified.
-- The api_key lives in `konnect serve`'s process memory. The proxy holds one long-lived WS connection per process; on first request it eager-connects + verifies attestation, so a bad key or attestation mismatch fails at startup, not at first user-visible request.
+- The api_key lives in the `konnect serve` process. Each kcvm image gets its own WS upgrade with the same bearer; the router enforces per-key rate limits and quota.
+- On startup, the proxy eager-connects the default model so attestation failures and bad api_keys fail-fast (exit 1) rather than at first user-visible request.
+
+### Other subcommands
+
+```
+konnect chat --message "hello"           # one-shot streaming chat to stdout
+echo "summarize this" | konnect chat     # reads stdin if --message is omitted
+
+konnect ping                             # connect + attest + /ping; exit 0/1
+                                         # useful for CI / monitoring probes
+```
+
+Both reuse the same config + env + flag layering as `serve`.
 
 ### Why a local proxy at all
 

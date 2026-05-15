@@ -44,7 +44,7 @@ export { KattValidator } from "./attestation/katt_validator.ts";
 // Attestation
 export type { AttestationValidator } from "./attestation/validator.ts";
 export { StubValidator } from "./attestation/validator.ts";
-export type { ConnectTiming, KawiriClientOptions } from "./client.ts";
+export type { ConnectTiming, KawiriClientOptions, RawResponse } from "./client.ts";
 export { KawiriClient } from "./client.ts";
 export type { Keypair } from "./noise/mod.ts";
 

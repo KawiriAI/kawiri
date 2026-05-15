@@ -17,21 +17,35 @@ api_key = "kw_REPLACE_ME"
 # WS upgrade via the Bearer header we add from `api_key`.
 target = "wss://api.kawiri.ai/v1/chat"
 
-# Which kcvm image the tunnel routes to. The WS upgrade carries this
-# as a query param; every request on the open WS goes to this image.
-# To serve a different model, run another `konnect serve` on a
-# different port with a different `model`.
-model = "qwen3-0.6b-q4-llamacpp-cpu_0.1.1"
+# Which kcvm images this proxy is permitted to open. The router pins
+# a model at WS-upgrade time, so each entry here gets its own
+# long-lived WS connection (lazy-opened on first request, idle-
+# evicted after `idle_close_ms`). First entry is the default model
+# used when a request omits the `model` field.
+#
+# Back-compat: setting `model = "x"` alone is equivalent to
+# `models = ["x"]`. v0.4 configs keep working.
+models = [
+  "qwen3-0.6b-q4-llamacpp-cpu_0.1.1",
+  # "qwen3-1.7b-q4-llamacpp-cpu_0.1.1",
+  # "qwen3-4b-q4-llamacpp-cpu_0.1.1",
+]
 
 # Local HTTP listener.
 bind = "127.0.0.1"
 port = 8090
+
+# Per-image WS lifecycle. Defaults shown.
+# idle_close_ms = 600000              # 10 min: close clients idle longer than this
+# liveness_probe_after_ms = 30000     # probe a stale client before reuse
+# liveness_probe_timeout_ms = 2500    # /ping deadline
 
 [security]
 # If set, inbound requests must carry `Authorization: Bearer <token>`
 # matching this value. Useful when the proxy is reachable from the
 # LAN (not just loopback). Leave unset for the common single-user
 # loopback case — local tools send any bearer and we accept it.
+# Compared via constant-time equality.
 # local_token = "devtok"
 
 # X-Wing post-quantum upgrade (default: on). Disabling halves the
@@ -45,12 +59,12 @@ enable_pq = true
 allow_mock_attestation = false
 
 # Model aliases. Each entry maps an OpenAI-shaped model name to the
-# kcvm image above. Useful so tools that hardcode `gpt-4o-mini` (etc.)
-# don't have to know the kcvm image name.
+# kcvm image that handles it. Every alias target MUST appear in
+# the `models` list above — the proxy validates this on startup
+# and refuses to start with a dangling alias.
 #
-# `/v1/models` advertises every alias as a separate row, but at
-# request time the WS is still pinned to one image — aliases are
-# just renaming, not multi-routing.
+# `/v1/models` advertises both the configured images and every
+# alias; chat requests for either name route to the right image.
 [aliases]
 # "gpt-4o-mini"   = "qwen3-0.6b-q4-llamacpp-cpu_0.1.1"
 # "qwen-small"    = "qwen3-0.6b-q4-llamacpp-cpu_0.1.1"

@@ -32,6 +32,20 @@ describe("parseArgs", () => {
 		expect(a.no_pq).toBe(true);
 	});
 
+	test("--models CSV becomes array", () => {
+		const a = parseArgs(["--models", "a,b,c"]);
+		expect(a.models).toEqual(["a", "b", "c"]);
+	});
+
+	test("--models trims and drops empty entries", () => {
+		const a = parseArgs(["--models", " a , b ,, c "]);
+		expect(a.models).toEqual(["a", "b", "c"]);
+	});
+
+	test("--models with empty CSV is rejected", () => {
+		expect(() => parseArgs(["--models", ", ,"])).toThrow();
+	});
+
 	test("invalid port rejected", () => {
 		expect(() => parseArgs(["--port", "abc"])).toThrow();
 		expect(() => parseArgs(["--port", "0"])).toThrow();
@@ -68,8 +82,8 @@ target = "wss://from-file.example/v1/chat"
 				expect(cfg.port).toBe(9000);
 				// env wins over file when no flag
 				expect(cfg.target).toBe("wss://from-env.example/v1/chat");
-				// file when no env, no flag
-				expect(cfg.model).toBe("qwen-0.6b");
+				// file when no env, no flag — single `model` becomes `[model]`
+				expect(cfg.models).toEqual(["qwen-0.6b"]);
 			},
 		);
 	});
@@ -79,9 +93,57 @@ target = "wss://from-file.example/v1/chat"
 		await expect(resolveConfig(args, {})).rejects.toThrow(/api_key required/);
 	});
 
-	test("model required somewhere", async () => {
+	test("at least one model required somewhere", async () => {
 		const args = parseArgs(["--api-key", "kw_x"]);
-		await expect(resolveConfig(args, {})).rejects.toThrow(/model is required/);
+		await expect(resolveConfig(args, {})).rejects.toThrow(/at least one model is required/);
+	});
+
+	test("--models takes precedence over --model", async () => {
+		const args = parseArgs([
+			"--api-key",
+			"kw_x",
+			"--model",
+			"ignored",
+			"--models",
+			"a,b",
+		]);
+		const cfg = await resolveConfig(args, {});
+		expect(cfg.models).toEqual(["a", "b"]);
+	});
+
+	test("config 'models' array beats config 'model' single", async () => {
+		await withTempFile(
+			`
+api_key = "kw_x"
+model = "ignored"
+models = ["a", "b", "c"]
+`,
+			async (file) => {
+				const cfg = await resolveConfig(parseArgs(["--config", file]), {});
+				expect(cfg.models).toEqual(["a", "b", "c"]);
+			},
+		);
+	});
+
+	test("env KONNECT_MODELS CSV", async () => {
+		const args = parseArgs(["--api-key", "kw_x"]);
+		const cfg = await resolveConfig(args, { KONNECT_MODELS: "a,b" });
+		expect(cfg.models).toEqual(["a", "b"]);
+	});
+
+	test("alias target must be in models", async () => {
+		await withTempFile(
+			`
+api_key = "kw_x"
+models = ["a", "b"]
+
+[aliases]
+"gpt-4o" = "c"
+`,
+			async (file) => {
+				await expect(resolveConfig(parseArgs(["--config", file]), {})).rejects.toThrow(/alias 'gpt-4o' targets 'c'/);
+			},
+		);
 	});
 
 	test("api_key_file is read", async () => {

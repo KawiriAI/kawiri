@@ -48,8 +48,16 @@ export interface KawiriClientOptions {
   webSocketFactory?: (url: string) => WebSocket;
 }
 
+/** Raw upstream response, before any ChatResult shaping. Used by
+ *  callers that need the verbatim engine JSON (embeddings, completions,
+ *  /v1/models, /ping, anything outside `/v1/chat/completions`). */
+export interface RawResponse {
+  status: number;
+  body: unknown;
+}
+
 interface PendingRequest {
-  resolve: (value: ChatResult) => void;
+  resolve: (value: ChatResult | RawResponse) => void;
   reject: (err: Error) => void;
   stream?: ReadableStreamDefaultController<string>;
   /**
@@ -61,6 +69,12 @@ interface PendingRequest {
    * extended OpenAI schema. Reset between requests.
    */
   reasoningOpen?: boolean;
+  /**
+   * When true, resolve with `RawResponse` ({status, body}) instead of
+   * `ChatResult`. Set by `requestRaw()`; left undefined for `request()`
+   * and `chat()` so they keep their existing ChatResult shape.
+   */
+  raw?: boolean;
 }
 
 export class KawiriClient {
@@ -388,6 +402,15 @@ export class KawiriClient {
       if (!p) return;
       this.pending.delete(resp.id);
 
+      // Raw-mode callers (requestRaw) get the upstream response
+      // verbatim — no ChatResult unwrap. Lets the OpenAI proxy
+      // relay embeddings, completions, /v1/models, etc. without
+      // misinterpreting them as chat completions.
+      if (p.raw) {
+        p.resolve({ status: resp.status, body: resp.body });
+        return;
+      }
+
       // Extract structured result — OpenAI-compatible or plain
       const body = resp.body;
       if (body && typeof body === "object" && "choices" in body) {
@@ -433,11 +456,34 @@ export class KawiriClient {
     }
   }
 
-  /** Send an arbitrary request and get the response. */
+  /** Send an arbitrary request and get a ChatResult-shaped response.
+   *  Convenience for `/v1/chat/completions`-style endpoints; if the
+   *  body isn't OpenAI-chat-shaped, the upstream JSON gets stringified
+   *  into `ChatResult.content` — usable but lossy. For non-chat
+   *  endpoints, use `requestRaw()` instead. */
   async request(method: "GET" | "POST", path: string, body?: unknown): Promise<ChatResult> {
     const id = this.nextId++;
     return new Promise<ChatResult>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(id, {
+        resolve: resolve as (v: ChatResult | RawResponse) => void,
+        reject,
+      });
+      this.sendRequest({ id, method, path, body }).catch(reject);
+    });
+  }
+
+  /** Send an arbitrary request and get the upstream response verbatim,
+   *  with status + raw body. Used by the OpenAI-compatibility proxy to
+   *  relay non-chat endpoints (embeddings, completions, models, audio,
+   *  images) without misinterpreting them as chat completions. */
+  async requestRaw(method: "GET" | "POST", path: string, body?: unknown): Promise<RawResponse> {
+    const id = this.nextId++;
+    return new Promise<RawResponse>((resolve, reject) => {
+      this.pending.set(id, {
+        resolve: resolve as (v: ChatResult | RawResponse) => void,
+        reject,
+        raw: true,
+      });
       this.sendRequest({ id, method, path, body }).catch(reject);
     });
   }

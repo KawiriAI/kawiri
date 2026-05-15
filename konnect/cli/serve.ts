@@ -5,24 +5,38 @@
  *   localhost:<port>  ←  plain OpenAI HTTP/SSE  ←  user's tool
  *         │
  *         ▼
- *   one long-lived KawiriClient over wss://api.kawiri.ai/v1/chat
+ *   ClientPool — one KawiriClient per configured kcvm image, sharing
+ *   one bearer. Each image's WS does its own Noise + attestation +
+ *   X-Wing PQ on first use; idle clients evict on a timer.
  *         │
- *         ▼  (Noise XX + attestation + X-Wing PQ)
- *   kawa inside the CVM, reverse-proxies to local llama.cpp/vllm
+ *         ▼
+ *   wss://api.kawiri.ai/v1/chat?model=<image>
+ *         │
+ *         ▼
+ *   teehost mTLS → kawa inside the CVM → llama.cpp / vllm / sglang
  *
- * One model per process: the WS upgrade carries `?model=<image>` and
- * every request on the same WS routes to that image. Aliases let
- * multiple OpenAI-shaped model names resolve to the same image
- * (handy for tools that hardcode "gpt-4o-mini").
+ * Two HTTP surfaces:
  *
- * Why a local proxy at all: kawa's tunnel is a custom Noise/X-Wing
+ *   1. Chat completions are re-encoded — streaming chunks become
+ *      OpenAI SSE, non-streaming becomes a single chat.completion
+ *      JSON. Necessary because konnect's protocol carries plain
+ *      content tokens, not OpenAI's chunk envelope.
+ *
+ *   2. Everything else under /v1/* is forwarded raw via
+ *      `client.requestRaw()`. Status code + body come back verbatim,
+ *      so embeddings, completions, models, audio, images all work
+ *      whenever the engine inside the CVM supports them.
+ *
+ * Why a local proxy at all: the Kawiri tunnel is a custom Noise/X-Wing
  * over WebSocket protocol. No OpenAI client speaks that. The proxy
  * runs on the user's machine — inside the trust boundary the tunnel
  * already terminates at — so it can decrypt and translate without
  * weakening the E2E guarantee.
  */
-import { type ChatMessage, type ChatOptions, KawiriClient, KattValidator, StubValidator } from "../core/mod.ts";
+import { timingSafeEqual } from "node:crypto";
+import { type ChatMessage, type ChatOptions, type KawiriClient } from "../core/mod.ts";
 import { parseArgs, resolveConfig, type ServeConfig } from "./config.ts";
+import { ClientPool } from "./pool.ts";
 
 export async function serveCmd(argv: readonly string[]): Promise<number> {
 	let cfg: ServeConfig;
@@ -37,184 +51,125 @@ export async function serveCmd(argv: readonly string[]): Promise<number> {
 
 	logEffectiveConfig(cfg);
 
-	const validator = cfg.allow_mock_attestation
-		? new KattValidator({ allowMock: true, liveCollateral: true })
-		: new KattValidator({ allowMock: false, liveCollateral: true });
-
-	const upstreamUrl = appendModelToUrl(cfg.target, cfg.model);
-	const client = new KawiriClient({
-		url: upstreamUrl,
-		validator,
+	const pool = new ClientPool({
+		target: cfg.target,
+		bearer: cfg.api_key,
+		allowedImages: new Set(cfg.models),
 		enablePQ: cfg.enable_pq,
-		debug: false,
-		webSocketFactory: (url) => bunWebSocketWithAuth(url, cfg.api_key),
-		onDisconnect: (reason) => {
-			console.warn(`[konnect serve] tunnel disconnected: ${reason}`);
-			// We'll lazily reconnect on next request.
-			state.connected = false;
-		},
+		allowMockAttestation: cfg.allow_mock_attestation,
+		idleCloseMs: cfg.idle_close_ms,
+		livenessProbeAfterMs: cfg.liveness_probe_after_ms,
+		livenessProbeTimeoutMs: cfg.liveness_probe_timeout_ms,
+		onClientReady: (image) => console.log(`[konnect serve] tunnel ready: ${image}`),
+		onClientClosed: (image, reason) => console.warn(`[konnect serve] tunnel closed: ${image} (${reason})`),
 	});
 
-	const state = {
-		connected: false,
-		connecting: false as Promise<void> | false,
-		client,
-	};
-
-	const ensureConnected = async (): Promise<void> => {
-		if (state.connected) return;
-		if (state.connecting) return state.connecting;
-		state.connecting = (async () => {
-			try {
-				await client.connect();
-				state.connected = true;
-			} finally {
-				state.connecting = false;
-			}
-		})();
-		return state.connecting;
-	};
-
-	// Eager connect: fail fast if the api_key is bad or attestation
-	// fails. Operator sees the error immediately instead of on first
-	// request.
+	// Eager-connect the default model so attestation failures and bad
+	// api_keys surface at startup rather than at the first user request.
+	const defaultImage = cfg.models[0]!;
 	try {
-		await ensureConnected();
-		console.log("[konnect serve] tunnel ready (attestation verified)");
+		await pool.withClient(defaultImage, async () => {});
+		console.log(`[konnect serve] tunnel ready (attestation verified, default model: ${defaultImage})`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		process.stderr.write(`konnect serve: failed to establish tunnel: ${msg}\n`);
+		await pool.closeAll();
 		return 1;
 	}
 
-	// HTTP listener. Bun.serve is the simplest option that supports
-	// streaming responses cleanly via ReadableStream.
 	const server = Bun.serve({
 		hostname: cfg.bind,
 		port: cfg.port,
-		fetch: async (req) => handleRequest(req, cfg, state, ensureConnected),
+		fetch: async (req) => handleRequest(req, cfg, pool),
 	});
 
 	console.log(`[konnect serve] listening on http://${server.hostname}:${server.port}`);
-	console.log(`[konnect serve] model: ${cfg.model}`);
+	if (cfg.models.length > 1) {
+		console.log(`[konnect serve] models: ${cfg.models.join(", ")} (default: ${defaultImage})`);
+	}
 	if (Object.keys(cfg.aliases).length > 0) {
 		console.log(`[konnect serve] aliases: ${Object.keys(cfg.aliases).join(", ")}`);
 	}
 
-	// Block forever — Bun.serve doesn't keep the event loop alive on
-	// its own when called from a top-level await.
-	return await new Promise<number>(() => {
-		// Never resolves; rely on Ctrl-C to terminate.
-	});
+	// Graceful shutdown: close every pooled WS so kawa sees a proper
+	// close frame instead of a TCP RST. SIGINT/SIGTERM both go through
+	// the same path; signal arrives mid-request → in-flight stream
+	// reads still finish (Bun.serve drains).
+	const shutdown = async (signal: string) => {
+		console.log(`\n[konnect serve] received ${signal}, draining...`);
+		server.stop(true);
+		await pool.closeAll();
+		process.exit(0);
+	};
+	process.on("SIGINT", () => void shutdown("SIGINT"));
+	process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+	// Park forever; SIGINT handler exits.
+	return await new Promise<number>(() => {});
 }
 
-interface ProxyState {
-	connected: boolean;
-	connecting: Promise<void> | false;
-	client: KawiriClient;
-}
+// ── HTTP routing ─────────────────────────────────────────────────
 
-async function handleRequest(
-	req: Request,
-	cfg: ServeConfig,
-	state: ProxyState,
-	ensureConnected: () => Promise<void>,
-): Promise<Response> {
+/** Map of path → handler. Order matters: matched top-to-bottom by
+ *  exact-path equality (with method check inside the handler). The
+ *  one entry that doesn't exact-match (`/v1/*` generic passthrough)
+ *  is handled after the table miss. */
+type Handler = (req: Request, cfg: ServeConfig, pool: ClientPool) => Promise<Response>;
+const ROUTES: Record<string, Handler> = {
+	"/healthz": handleHealthz,
+	"/readyz": handleReadyz,
+	"/v1/models": handleModels,
+	"/v1/models/": handleModels,
+	"/v1/chat/completions": handleChatCompletions,
+};
+
+async function handleRequest(req: Request, cfg: ServeConfig, pool: ClientPool): Promise<Response> {
 	const url = new URL(req.url);
 	const path = url.pathname;
 
-	// Inbound bearer enforcement, if configured. Default policy: any
-	// bearer (or none) is fine on loopback. Operator opts into a strict
-	// check by setting [security].local_token.
-	if (cfg.local_token) {
-		const provided = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
-		if (provided !== cfg.local_token) {
-			return jsonError(401, "unauthorized", "inbound bearer does not match KONNECT_LOCAL_TOKEN");
-		}
-	}
+	const authCheck = enforceLocalToken(cfg, req);
+	if (authCheck) return authCheck;
 
-	// Liveness probe — pure local, doesn't require the tunnel.
-	if (path === "/healthz") {
-		return new Response("ok\n", { status: 200, headers: { "content-type": "text/plain" } });
-	}
+	const route = ROUTES[path];
+	if (route) return route(req, cfg, pool);
 
-	// Readiness — only ok if the tunnel is attested + connected.
-	if (path === "/readyz") {
-		return state.connected
-			? new Response("ok\n", { status: 200, headers: { "content-type": "text/plain" } })
-			: new Response("tunnel not ready\n", { status: 503, headers: { "content-type": "text/plain" } });
-	}
-
-	// Synthesized model list — the engine inside the CVM serves one
-	// model per process, so we tell tools about it plus every alias.
-	if (req.method === "GET" && (path === "/v1/models" || path === "/v1/models/")) {
-		return Response.json(modelsResponse(cfg));
-	}
-
-	// Anything else must hit the tunnel. Reconnect lazily if needed.
-	try {
-		await ensureConnected();
-	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		return jsonError(502, "tunnel_unavailable", msg);
-	}
-
-	// Streaming chat — special-case because we re-encode konnect's
-	// plain token stream as OpenAI SSE chunks.
-	if (req.method === "POST" && path === "/v1/chat/completions") {
-		return handleChatCompletions(req, cfg, state.client);
-	}
-
-	// Generic passthrough for any other /v1/* the engine supports
-	// (embeddings, completions, audio/*, images/*, …). konnect's
-	// `request()` already speaks the framed JSON shape; the upstream
-	// engine returns OpenAI-shaped JSON which we relay verbatim.
-	if (path.startsWith("/v1/")) {
-		const method = req.method as "GET" | "POST";
-		if (method !== "GET" && method !== "POST") {
-			return jsonError(405, "method_not_allowed", `unsupported method: ${req.method}`);
-		}
-		let body: unknown;
-		if (method === "POST") {
-			try {
-				body = await req.json();
-			} catch {
-				return jsonError(400, "bad_request", "POST body must be valid JSON");
-			}
-		}
-		try {
-			const upstream = await state.client.request(method, path, body);
-			// konnect's `request()` returns ChatResult-shaped, but for
-			// non-chat endpoints the engine returns its native JSON.
-			// kawa packs that into ChatResult.content as a JSON-stringified
-			// blob (or returns the body verbatim — depends on the kawa
-			// proxy shape). We return whatever shape we got.
-			return Response.json(upstream);
-		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-			return jsonError(502, "tunnel_error", msg);
-		}
-	}
+	// Generic /v1/* passthrough — anything the engine inside the CVM
+	// serves works without per-route code.
+	if (path.startsWith("/v1/")) return handleGenericV1(req, cfg, pool);
 
 	return jsonError(404, "not_found", `${req.method} ${path}`);
 }
 
-/** OpenAI `/v1/models` response shape. Synthesized — the upstream
- *  engine inside the CVM is single-image; we report the configured
- *  image plus any aliases as separate model rows so tools see what
- *  they expect. */
-function modelsResponse(cfg: ServeConfig): unknown {
+// ── handlers ────────────────────────────────────────────────────
+
+async function handleHealthz(): Promise<Response> {
+	return new Response("ok\n", { status: 200, headers: { "content-type": "text/plain" } });
+}
+
+async function handleReadyz(_req: Request, _cfg: ServeConfig, pool: ClientPool): Promise<Response> {
+	// Ready means: pool isn't empty (the eager-opened default model
+	// is still alive). Tells consumers (k8s probes, monitoring) when
+	// the proxy can actually carry traffic.
+	const open = pool.size();
+	const status = open > 0 ? 200 : 503;
+	return Response.json({ ok: open > 0, clients_open: open, stats: pool.stats() }, { status });
+}
+
+async function handleModels(_req: Request, cfg: ServeConfig): Promise<Response> {
 	const created = Math.floor(Date.now() / 1000);
-	const rows = [
-		{ id: cfg.model, object: "model", created, owned_by: "kawiri" },
-		...Object.keys(cfg.aliases).map((alias) => ({
-			id: alias,
-			object: "model",
-			created,
-			owned_by: "kawiri",
-		})),
-	];
-	return { object: "list", data: rows };
+	const seen = new Set<string>();
+	const rows: { id: string; object: "model"; created: number; owned_by: string }[] = [];
+	for (const image of cfg.models) {
+		if (seen.has(image)) continue;
+		seen.add(image);
+		rows.push({ id: image, object: "model", created, owned_by: "kawiri" });
+	}
+	for (const alias of Object.keys(cfg.aliases)) {
+		if (seen.has(alias)) continue;
+		seen.add(alias);
+		rows.push({ id: alias, object: "model", created, owned_by: "kawiri" });
+	}
+	return Response.json({ object: "list", data: rows });
 }
 
 interface ChatCompletionRequest {
@@ -229,7 +184,9 @@ interface ChatCompletionRequest {
 	stop?: string | string[];
 }
 
-async function handleChatCompletions(req: Request, cfg: ServeConfig, client: KawiriClient): Promise<Response> {
+async function handleChatCompletions(req: Request, cfg: ServeConfig, pool: ClientPool): Promise<Response> {
+	if (req.method !== "POST") return jsonError(405, "method_not_allowed", `${req.method} /v1/chat/completions`);
+
 	let body: ChatCompletionRequest;
 	try {
 		body = (await req.json()) as ChatCompletionRequest;
@@ -240,16 +197,9 @@ async function handleChatCompletions(req: Request, cfg: ServeConfig, client: Kaw
 		return jsonError(400, "bad_request", "messages array required");
 	}
 
-	// Model resolution: incoming alias → configured kcvm image. The
-	// upstream WS is already pinned to the configured image, so the
-	// `model` we ship in the body is purely advisory for the engine.
-	const requestedModel = body.model ?? cfg.model;
-	const resolvedModel = cfg.aliases[requestedModel] ?? requestedModel;
-	if (resolvedModel !== cfg.model && !Object.values(cfg.aliases).includes(resolvedModel)) {
-		// Unknown model — the WS is pinned elsewhere. Tools that ask
-		// for a model we can't serve should get a clear refusal, not
-		// silent rerouting. (We don't bother spinning up a second
-		// tunnel in v0.)
+	const requestedModel = body.model ?? cfg.models[0]!;
+	const image = resolveModel(cfg, requestedModel);
+	if (!image) {
 		return jsonError(404, "model_not_found", `model '${requestedModel}' not configured on this proxy`);
 	}
 
@@ -263,50 +213,130 @@ async function handleChatCompletions(req: Request, cfg: ServeConfig, client: Kaw
 
 	const chatId = `chatcmpl-${randomHex(16)}`;
 	const created = Math.floor(Date.now() / 1000);
-	const advertisedModel = requestedModel;
 
 	if (body.stream === true) {
-		// Streaming SSE.
-		const tokenStream = client.chatStream(body.messages, resolvedModel, options);
-		const sse = renderSse(tokenStream, chatId, created, advertisedModel);
+		// Streaming SSE. We can't use `pool.withClient` here because the
+		// stream outlives this function — manually acquire + release
+		// inside the SSE wrapper's cancel/done branches.
+		let client: KawiriClient;
+		try {
+			client = await pool.acquire(image);
+		} catch (e) {
+			return jsonError(502, "tunnel_unavailable", e instanceof Error ? e.message : String(e));
+		}
+		const tokenStream = client.chatStream(body.messages, image, options);
+		const sse = renderSse(tokenStream, chatId, created, requestedModel, () => pool.release(image));
 		return new Response(sse, {
 			status: 200,
 			headers: {
 				"content-type": "text/event-stream",
 				"cache-control": "no-cache, no-transform",
 				connection: "keep-alive",
-				"x-accel-buffering": "no", // hint to any intermediaries
+				"x-accel-buffering": "no",
 			},
 		});
 	}
 
-	// Non-streaming: aggregate the stream into a single response.
-	// We use chat() rather than chatStream() so the upstream can
-	// optimize (some engines have a faster path for non-streaming).
+	// Non-streaming: aggregate via `chat()`. withClient's finally
+	// handles release on both success and error.
 	try {
-		const result = await client.chat(body.messages, resolvedModel, options);
-		return Response.json({
-			id: chatId,
-			object: "chat.completion",
-			created,
-			model: advertisedModel,
-			choices: [
-				{
-					index: 0,
-					message: { role: "assistant", content: result.content },
-					finish_reason: result.finish_reason ?? "stop",
+		return await pool.withClient(image, async (client) => {
+			const result = await client.chat(body.messages!, image, options);
+			return Response.json({
+				id: chatId,
+				object: "chat.completion",
+				created,
+				model: requestedModel,
+				choices: [
+					{
+						index: 0,
+						message: { role: "assistant", content: result.content },
+						finish_reason: result.finish_reason ?? "stop",
+					},
+				],
+				usage: result.usage ?? {
+					prompt_tokens: 0,
+					completion_tokens: 0,
+					total_tokens: 0,
 				},
-			],
-			usage: result.usage ?? {
-				prompt_tokens: 0,
-				completion_tokens: 0,
-				total_tokens: 0,
-			},
+			});
 		});
 	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		return jsonError(502, "upstream_error", msg);
+		return jsonError(502, "upstream_error", e instanceof Error ? e.message : String(e));
 	}
+}
+
+/** Generic forwarder for `/v1/*` routes the proxy doesn't reshape
+ *  (embeddings, completions, audio, images, …). Returns whatever the
+ *  upstream engine emitted: status, JSON body. */
+async function handleGenericV1(req: Request, cfg: ServeConfig, pool: ClientPool): Promise<Response> {
+	if (req.method !== "GET" && req.method !== "POST") {
+		return jsonError(405, "method_not_allowed", `${req.method} ${new URL(req.url).pathname}`);
+	}
+
+	// Try to read a model hint from the body (most non-chat OpenAI
+	// endpoints take one, e.g. /v1/embeddings has {model, input}). If
+	// absent, fall back to the default image. If the body isn't valid
+	// JSON, forward as null — endpoints that don't take a body (GET)
+	// don't care.
+	let parsedBody: unknown = undefined;
+	if (req.method === "POST") {
+		const text = await req.text();
+		if (text.length > 0) {
+			try {
+				parsedBody = JSON.parse(text);
+			} catch {
+				return jsonError(400, "bad_request", "POST body must be valid JSON");
+			}
+		}
+	}
+	const modelHint =
+		parsedBody && typeof parsedBody === "object" && "model" in parsedBody
+			? String((parsedBody as { model: unknown }).model ?? "")
+			: "";
+	const image = modelHint ? resolveModel(cfg, modelHint) : cfg.models[0]!;
+	if (!image) {
+		return jsonError(404, "model_not_found", `model '${modelHint}' not configured on this proxy`);
+	}
+
+	const path = new URL(req.url).pathname;
+	try {
+		return await pool.withClient(image, async (client) => {
+			const upstream = await client.requestRaw(req.method as "GET" | "POST", path, parsedBody);
+			return new Response(JSON.stringify(upstream.body ?? null), {
+				status: upstream.status || 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+	} catch (e) {
+		return jsonError(502, "upstream_error", e instanceof Error ? e.message : String(e));
+	}
+}
+
+// ── helpers ──────────────────────────────────────────────────────
+
+function resolveModel(cfg: ServeConfig, requested: string): string | null {
+	if (cfg.aliases[requested]) return cfg.aliases[requested]!;
+	if (cfg.models.includes(requested)) return requested;
+	return null;
+}
+
+function enforceLocalToken(cfg: ServeConfig, req: Request): Response | null {
+	if (!cfg.local_token) return null;
+	const provided = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+	// `timingSafeEqual` requires equal-length buffers; pre-check the
+	// length so a wrong-length token doesn't throw on the compare.
+	// On length mismatch we still call timingSafeEqual on dummy data
+	// to keep the failure path's timing similar.
+	const expected = cfg.local_token;
+	const a = Buffer.from(provided.padEnd(expected.length, "\0").slice(0, expected.length));
+	const b = Buffer.from(expected);
+	const sameLength = provided.length === expected.length;
+	const sameBytes = timingSafeEqual(a, b);
+	if (!sameLength || !sameBytes) {
+		return jsonError(401, "unauthorized", "inbound bearer does not match local_token");
+	}
+	return null;
 }
 
 /**
@@ -318,18 +348,30 @@ async function handleChatCompletions(req: Request, cfg: ServeConfig, client: Kaw
  *   3. A final chunk with `finish_reason = "stop"` and empty delta.
  *   4. The `data: [DONE]\n\n` sentinel.
  *
- * Errors mid-stream are surfaced as a chunk with `finish_reason =
- * "error"` plus a final [DONE] so the client closes cleanly rather
- * than hanging on a dropped connection.
+ * Errors mid-stream surface as a chunk with `finish_reason = "error"`
+ * plus a final [DONE] so the client closes cleanly rather than
+ * hanging on a dropped connection.
+ *
+ * The `onClose` callback fires when the stream terminates (any
+ * reason — done, error, or client-side cancel). It's how the chat
+ * handler releases the pool entry so eviction counts can drain.
  */
 export function renderSse(
 	tokens: ReadableStream<string>,
 	chatId: string,
 	created: number,
 	model: string,
+	onClose?: () => void,
 ): ReadableStream<Uint8Array> {
 	const enc = new TextEncoder();
 	const reader = tokens.getReader();
+
+	let closeFired = false;
+	const fireClose = () => {
+		if (closeFired) return;
+		closeFired = true;
+		onClose?.();
+	};
 
 	return new ReadableStream<Uint8Array>({
 		async start(c) {
@@ -344,9 +386,6 @@ export function renderSse(
 				c.enqueue(enc.encode("data: [DONE]\n\n"));
 			} catch (e) {
 				const msg = e instanceof Error ? e.message : String(e);
-				// Surface the error in-band so the client sees something
-				// before the stream closes. Non-standard `error` finish
-				// reason matches what OpenAI does in some failure modes.
 				c.enqueue(
 					enc.encode(
 						sseChunk(chatId, created, model, { content: `\n\n[stream error: ${msg}]` }, "error"),
@@ -356,13 +395,12 @@ export function renderSse(
 			} finally {
 				c.close();
 				reader.releaseLock();
+				fireClose();
 			}
 		},
 		cancel() {
-			// Client aborted (closed their connection mid-stream). Stop
-			// pulling tokens from the upstream so we don't keep the
-			// inference engine producing for a dead consumer.
 			reader.cancel().catch(() => {});
+			fireClose();
 		},
 	});
 }
@@ -384,32 +422,8 @@ function sseChunk(
 	return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-/**
- * Bun-only WebSocket constructor that injects an Authorization header.
- * Browsers can't set custom WS headers, but Bun (and Node's `ws` and
- * Deno's WebSocketStream) support an options-bag second argument with
- * a `headers` field. The cast to `string[]` is a lie to TypeScript's
- * browser-flavored DOM types so the same library compiles for both.
- */
-function bunWebSocketWithAuth(url: string, bearer: string): WebSocket {
-	const opts = { headers: { Authorization: `Bearer ${bearer}` } } as unknown as string[];
-	return new WebSocket(url, opts);
-}
-
-/** Append `?model=<image>` to the WS URL, preserving any existing query. */
-function appendModelToUrl(url: string, model: string): string {
-	// We can't use the URL class with `wss:` directly in all runtimes,
-	// but it works in Bun. Fall back to a string-append on parse error.
-	try {
-		const u = new URL(url);
-		u.searchParams.set("model", model);
-		return u.toString();
-	} catch {
-		const sep = url.includes("?") ? "&" : "?";
-		return `${url}${sep}model=${encodeURIComponent(model)}`;
-	}
-}
-
+/** OpenAI-shaped error responses. Standardized so every failure path
+ *  comes back as `{ "error": { "code", "message" } }`. */
 function jsonError(status: number, code: string, message: string): Response {
 	return Response.json({ error: { code, message } }, { status });
 }
@@ -423,12 +437,13 @@ function randomHex(bytes: number): string {
 function logEffectiveConfig(cfg: ServeConfig): void {
 	console.log("[konnect serve] effective config:");
 	console.log(`  target:    ${cfg.target}`);
-	console.log(`  model:     ${cfg.model}`);
+	console.log(`  models:    ${cfg.models.join(", ")}`);
 	console.log(`  bind:      ${cfg.bind}:${cfg.port}`);
 	console.log(`  api_key:   ${cfg.api_key.slice(0, 6)}…${cfg.api_key.slice(-4)} (${cfg.api_key.length} chars)`);
 	console.log(`  pq:        ${cfg.enable_pq ? "on" : "off"}`);
 	console.log(`  mock_att:  ${cfg.allow_mock_attestation ? "ALLOWED (INSECURE)" : "off"}`);
 	console.log(`  local_tok: ${cfg.local_token ? "set" : "not set"}`);
+	console.log(`  idle_evict: ${cfg.idle_close_ms ? `${cfg.idle_close_ms}ms` : "off"}`);
 	if (Object.keys(cfg.aliases).length > 0) {
 		console.log("  aliases:");
 		for (const [from, to] of Object.entries(cfg.aliases)) {
@@ -436,7 +451,3 @@ function logEffectiveConfig(cfg: ServeConfig): void {
 		}
 	}
 }
-
-// Silence unused import warnings — StubValidator is referenced indirectly
-// via the KattValidator fallback comment above.
-void StubValidator;

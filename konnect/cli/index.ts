@@ -21,6 +21,8 @@
  * library at ../core/mod.ts has no runtime dependency on this file
  * — bin scripts are not bundled when consumers `import` the library.
  */
+import { chatCmd } from "./chat.ts";
+import { pingCmd } from "./ping.ts";
 import { serveCmd } from "./serve.ts";
 
 const USAGE = `Usage: konnect <command> [options]
@@ -58,10 +60,10 @@ async function main(): Promise<number> {
 	switch (cmd) {
 		case "serve":
 			return await serveCmd(rest);
-		case "chat":
 		case "ping":
-			process.stderr.write(`konnect: '${cmd}' not yet implemented in v0\n`);
-			return 2;
+			return await pingCmd(rest);
+		case "chat":
+			return await chatCmd(rest);
 		default:
 			process.stderr.write(`konnect: unknown command '${cmd}'\n\n${USAGE}`);
 			return 2;
