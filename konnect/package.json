@@ -1,18 +1,22 @@
 {
   "name": "@kawiri/konnect",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "exports": "./core/mod.ts",
+  "bin": {
+    "konnect": "./cli/index.ts"
+  },
   "scripts": {
     "check": "tsc --noEmit && biome check .",
     "lint": "biome check .",
     "format": "biome check --write .",
-    "test": "bun test core/test/ katt/test/"
+    "test": "bun test core/test/ katt/test/ cli/test/"
   },
   "dependencies": {
     "@noble/curves": "1.8.1",
     "@noble/hashes": "1.7.1",
-    "@noble/post-quantum": "0.5.4"
+    "@noble/post-quantum": "0.5.4",
+    "smol-toml": "^1.4.2"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.9",

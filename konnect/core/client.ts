@@ -31,6 +31,21 @@ export interface KawiriClientOptions {
   connectTimeout?: number; // default: 10000 (10s)
   debug?: boolean; // default: false — log handshake timing via console.debug
   onDisconnect?: (reason: string) => void;
+  /**
+   * Hook for runtimes that can attach extra info to the underlying
+   * WebSocket connection (most often: an `Authorization: Bearer …`
+   * header for hitting api.kawiri.ai from a Bun/Node CLI). Default
+   * is `new WebSocket(url)`, which is what the browser supports.
+   *
+   * The factory MUST return a WebSocket whose `binaryType` is set
+   * to `"arraybuffer"` (or willingly accept the caller setting it
+   * after return). Anything else and frame decoding breaks.
+   *
+   * Used by `konnect serve` (the OpenAI-compat proxy) to inject the
+   * Kawiri API key as a Bearer header — browsers can't set custom
+   * WS headers, but Node/Bun/Deno can.
+   */
+  webSocketFactory?: (url: string) => WebSocket;
 }
 
 interface PendingRequest {
@@ -72,6 +87,7 @@ export class KawiriClient {
       connectTimeout: opts.connectTimeout ?? 10000,
       debug: opts.debug ?? false,
       onDisconnect: opts.onDisconnect ?? (() => {}),
+      webSocketFactory: opts.webSocketFactory ?? ((u) => new WebSocket(u)),
     };
   }
 
@@ -122,7 +138,7 @@ export class KawiriClient {
         }
       }, this.options.connectTimeout);
 
-      const ws = new WebSocket(this.options.url);
+      const ws = this.options.webSocketFactory(this.options.url);
       ws.binaryType = "arraybuffer";
       this.ws = ws;
 
