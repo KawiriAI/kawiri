@@ -176,6 +176,18 @@ export class ClientPool {
 		entry.lastSuccessAt = Date.now();
 	}
 
+	/** Bump the entry's "last success" timestamp without changing
+	 *  the in-flight refcount. Called per token during a long stream
+	 *  so idle eviction doesn't fire mid-generation if a future bug
+	 *  somehow leaves `inFlight === 0` while bytes are still flowing.
+	 *  Cheap (one Map lookup + one assignment) and bug-free no-op
+	 *  when the entry has already been evicted. */
+	touchLastSuccess(image: string): void {
+		const entry = this.entries.get(image);
+		if (!entry) return;
+		entry.lastSuccessAt = Date.now();
+	}
+
 	/** Convenience wrapper: acquire → run fn → release, with the
 	 *  release fired in `finally`. Safe even if `fn` throws. */
 	async withClient<T>(image: string, fn: (client: KawiriClient) => Promise<T>): Promise<T> {

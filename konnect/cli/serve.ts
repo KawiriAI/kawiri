@@ -225,7 +225,18 @@ async function handleChatCompletions(req: Request, cfg: ServeConfig, pool: Clien
 			return jsonError(502, "tunnel_unavailable", e instanceof Error ? e.message : String(e));
 		}
 		const tokenStream = client.chatStream(body.messages, image, options);
-		const sse = renderSse(tokenStream, chatId, created, requestedModel, () => pool.release(image));
+		const sse = renderSse(
+			tokenStream,
+			chatId,
+			created,
+			requestedModel,
+			() => pool.release(image),
+			// Per-token keepalive: bump lastSuccessAt while the stream
+			// is alive. Belt-and-suspenders against an inFlight-refcount
+			// bug evicting a long-running stream mid-generation — every
+			// token proves the upstream is healthy.
+			() => pool.touchLastSuccess(image),
+		);
 		return new Response(sse, {
 			status: 200,
 			headers: {
@@ -362,6 +373,7 @@ export function renderSse(
 	created: number,
 	model: string,
 	onClose?: () => void,
+	onToken?: () => void,
 ): ReadableStream<Uint8Array> {
 	const enc = new TextEncoder();
 	const reader = tokens.getReader();
@@ -380,6 +392,7 @@ export function renderSse(
 				while (true) {
 					const { value, done } = await reader.read();
 					if (done) break;
+					onToken?.();
 					c.enqueue(enc.encode(sseChunk(chatId, created, model, { content: value }, null)));
 				}
 				c.enqueue(enc.encode(sseChunk(chatId, created, model, {}, "stop")));

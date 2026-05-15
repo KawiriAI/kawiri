@@ -115,4 +115,43 @@ describe("renderSse", () => {
 			expect(b.startsWith("data: ")).toBe(true);
 		}
 	});
+
+	test("onToken fires once per content chunk; onClose fires exactly once at stream end", async () => {
+		const tokens = tokenStreamFrom(["a", "b", "c"]);
+		let tokenCalls = 0;
+		let closeCalls = 0;
+		await collectSse(
+			renderSse(
+				tokens,
+				"x",
+				0,
+				"m",
+				() => {
+					closeCalls++;
+				},
+				() => {
+					tokenCalls++;
+				},
+			),
+		);
+		expect(tokenCalls).toBe(3); // one per content token
+		expect(closeCalls).toBe(1); // once, at end
+	});
+
+	test("onClose fires exactly once even on error mid-stream", async () => {
+		const tokens = tokenStreamFrom(["one"], 1);
+		let closeCalls = 0;
+		await collectSse(
+			renderSse(
+				tokens,
+				"x",
+				0,
+				"m",
+				() => {
+					closeCalls++;
+				},
+			),
+		);
+		expect(closeCalls).toBe(1);
+	});
 });

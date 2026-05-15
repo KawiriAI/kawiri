@@ -223,4 +223,45 @@ describe("ClientPool", () => {
 		await pool.closeAll();
 		await expect(pool.acquire("a")).rejects.toThrow(/closed/);
 	});
+
+	test("touchLastSuccess bumps the entry's timer without changing inFlight", async () => {
+		const { pool: p } = makePool();
+		pool = p;
+		await pool.acquire("a");
+		pool.release("a");
+		// Let some idle time accumulate before the touch.
+		await new Promise((r) => setTimeout(r, 30));
+		const before = pool.stats()[0]!;
+		expect(before.idleMs).toBeGreaterThanOrEqual(25);
+		pool.touchLastSuccess("a");
+		const after = pool.stats()[0]!;
+		// Idle clock reset (≈0); inFlight unchanged.
+		expect(after.idleMs).toBeLessThan(before.idleMs);
+		expect(after.inFlight).toBe(before.inFlight);
+	});
+
+	test("touchLastSuccess on a missing entry is a safe no-op", async () => {
+		const { pool: p } = makePool();
+		pool = p;
+		// Never opened — should not throw.
+		expect(() => pool.touchLastSuccess("never-opened")).not.toThrow();
+	});
+
+	test("touchLastSuccess defers idle eviction across a long stream window", async () => {
+		// Eviction interval ticks at idleCloseMs / 4. With a 200ms window
+		// that's a 50ms tick. We bump the timer every 30ms and verify the
+		// entry survives the eviction sweep that would otherwise reap it.
+		const { pool: p } = makePool({ idleCloseMs: 200, livenessProbeAfterMs: 999_999 });
+		pool = p;
+		await pool.acquire("a");
+		pool.release("a");
+		// inFlight is now 0; entry would normally evict ~200ms from now.
+		for (let i = 0; i < 8; i++) {
+			await new Promise((r) => setTimeout(r, 30));
+			pool.touchLastSuccess("a");
+		}
+		// Total elapsed ~240ms > 200ms idle window, but the touches kept
+		// it alive.
+		expect(pool.size()).toBe(1);
+	});
 });
