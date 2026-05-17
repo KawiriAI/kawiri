@@ -40,7 +40,7 @@ description = "configuration disk"
 
 # Runtime environment variables — written to config.env on the config verity disk
 [config_env]
-LLAMACPP_MODEL = "/mnt/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_0.gguf"
+LLAMACPP_MODEL = "/mnt/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 LLAMACPP_THREADS = "4"
 UPSTREAM_URL = "http://127.0.0.1:8080"
 ENABLE_PQ = "true"
@@ -48,7 +48,7 @@ ENABLE_PQ = "true"
 # Models — auto-downloaded during `cvmbuild build`
 [[models]]
 repo = "unsloth/Qwen3.5-4B-GGUF"
-include = ["*Q4_0*"]
+include = ["*UD-Q4_K_XL*"]
 
 # Services
 [services]
@@ -66,7 +66,7 @@ condition_path_exists = "/sys/kernel/config"
 [[services.units]]
 name = "llamacpp"
 description = "llama.cpp inference server"
-exec = "/usr/local/bin/llama-server --model ${LLAMACPP_MODEL} --host 127.0.0.1 --port 8080 --ctx-size 4096 --threads ${LLAMACPP_THREADS}"
+exec = "/usr/local/bin/llama-server --model ${LLAMACPP_MODEL} --host 127.0.0.1 --port 8080 --ctx-size 8192 --threads ${LLAMACPP_THREADS} --jinja"
 after = ["verity-config.service", "verity-models.service", "lock-modules.service"]
 requires = ["verity-config.service", "verity-models.service"]
 environment_file = "/mnt/config/config.env"
