@@ -1,4 +1,4 @@
-# kawiri-cvm — Qwen3.5-2B llama.cpp Q4 CPU inference image
+# kawiri-cvm — Qwen3.5-4B llama.cpp Q4 CPU inference image
 #
 # Requires: cvm-base:latest (built automatically by cvmbuild)
 #

@@ -8,9 +8,9 @@ kcvm/images/*/build/
 kcvm/images/*/disks/
 
 # Test SSH private keys never get committed; only the .pub half goes in git
-# so cvm.toml can reference a deterministic public key. The private half lives
-# only on the developer's machine — collaborators get their own keypair and
-# rebuild the image with their pubkey (different pubkey ⇒ different SNP
+# so the image build references a deterministic public key. The private half
+# lives only on the developer's machine — collaborators get their own keypair
+# and rebuild the image with their pubkey (different pubkey ⇒ different SNP
 # measurement ⇒ a different image identity, which is the right property).
-kcvm/test-fixtures/ssh-keys/*
-!kcvm/test-fixtures/ssh-keys/*.pub
+kcvm/images/ubuntu-26.04-ssh-cvm/kawiri-test
+!kcvm/images/ubuntu-26.04-ssh-cvm/kawiri-test.pub

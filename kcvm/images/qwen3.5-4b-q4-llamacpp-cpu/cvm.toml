@@ -1,8 +1,8 @@
-# CVM image configuration — Qwen3.5-2B llama.cpp Q4 CPU inference
+# CVM image configuration — Qwen3.5-4B llama.cpp Q4 CPU inference
 # Built by cvmbuild (pure Rust CVM image builder)
 
 [image]
-id = "qwen3.5-2b-q4-llamacpp-cpu"
+id = "qwen3.5-4b-q4-llamacpp-cpu"
 version = "0.1.0"
 base = "Dockerfile"
 context = "../.."
@@ -40,14 +40,14 @@ description = "configuration disk"
 
 # Runtime environment variables — written to config.env on the config verity disk
 [config_env]
-LLAMACPP_MODEL = "/mnt/models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_0.gguf"
+LLAMACPP_MODEL = "/mnt/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_0.gguf"
 LLAMACPP_THREADS = "4"
 UPSTREAM_URL = "http://127.0.0.1:8080"
 ENABLE_PQ = "true"
 
 # Models — auto-downloaded during `cvmbuild build`
 [[models]]
-repo = "unsloth/Qwen3.5-2B-GGUF"
+repo = "unsloth/Qwen3.5-4B-GGUF"
 include = ["*Q4_0*"]
 
 # Services
