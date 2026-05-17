@@ -23,7 +23,7 @@ The host management plane is responsible for booting the VM and
 forwarding a host port to guest port 22. Once it tells you the port:
 
 ```bash
-ssh -i kawiri/kcvm/test-fixtures/ssh-keys/kawiri-test \
+ssh -i kawiri/kcvm/images/ubuntu-26.04-ssh-cvm/kawiri-test \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -p <host_port> root@<vm-host>
 ```
@@ -59,7 +59,7 @@ fingerprint: "this is not running on real TEE hardware."
 ## Test SSH key (`kawiri-test`)
 
 The repo ships only the **public** half at
-`kcvm/test-fixtures/ssh-keys/kawiri-test.pub`. The matching private key
+`kcvm/images/ubuntu-26.04-ssh-cvm/kawiri-test.pub`. The matching private key
 lives on the developer's machine and is gitignored. Anyone wanting to test
 the end-to-end SSH flow either gets the private key out-of-band or
 generates their own keypair and rebuilds the image with their pubkey baked
