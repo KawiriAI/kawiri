@@ -9,7 +9,7 @@
 #
 # CUDA toolkit is only needed at build time — llama-server links statically.
 
-ARG LLAMACPP_VERSION=b8470
+ARG LLAMACPP_VERSION=b9198
 ARG CUDA_VERSION=12-6
 
 # ============================================================

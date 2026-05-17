@@ -11,7 +11,7 @@
 #   - Apt mirror pinned to snapshot date (inherited from cvm-base)
 #   - llama.cpp pinned by git tag
 
-ARG LLAMACPP_VERSION=b8470
+ARG LLAMACPP_VERSION=b9198
 
 # ============================================================
 # Stage 1: Build llama.cpp from source
