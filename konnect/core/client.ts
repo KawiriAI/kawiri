@@ -488,8 +488,12 @@ export class KawiriClient {
     });
   }
 
-  /** Non-streaming chat */
-  async chat(messages: ChatMessage[], model = "default", options?: ChatOptions): Promise<ChatResult> {
+  /** Non-streaming chat. `model` is optional — when omitted, the request body
+   *  carries no `model` field and kawa records the event with model unset
+   *  (rendered as "—" in dashboards / unrolled to image_name by aggregators).
+   *  Pass the actual model identifier (== kcvm image_name today) for clean
+   *  per-model attribution in the metering pipeline. */
+  async chat(messages: ChatMessage[], model?: string, options?: ChatOptions): Promise<ChatResult> {
     const id = this.nextId++;
     return new Promise<ChatResult>((resolve, reject) => {
       this.pending.set(id, {
@@ -500,13 +504,14 @@ export class KawiriClient {
         id,
         method: "POST",
         path: "/v1/chat/completions",
-        body: { ...options, messages, model, stream: false },
+        body: { ...options, messages, ...(model ? { model } : {}), stream: false },
       }).catch(reject);
     });
   }
 
-  /** Streaming chat — returns a ReadableStream of content tokens */
-  chatStream(messages: ChatMessage[], model = "default", options?: ChatOptions): ReadableStream<string> {
+  /** Streaming chat — returns a ReadableStream of content tokens. See `chat`
+   *  for `model` semantics. */
+  chatStream(messages: ChatMessage[], model?: string, options?: ChatOptions): ReadableStream<string> {
     const id = this.nextId++;
 
     const stream = new ReadableStream<string>({
@@ -520,7 +525,7 @@ export class KawiriClient {
           id,
           method: "POST",
           path: "/v1/chat/completions",
-          body: { ...options, messages, model, stream: true },
+          body: { ...options, messages, ...(model ? { model } : {}), stream: true },
         }).catch((err) => c.error(err));
       },
     });
