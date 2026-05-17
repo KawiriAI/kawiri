@@ -136,3 +136,11 @@ ovmf_file = "OVMF_TDX.fd"
 profile = "production"
 # kawa needs ProtectKernelTunables=no for /sys/kernel/config (SEV-SNP tsm attestation)
 exclude = ["service_no_protect_kernel_tunables_off"]
+
+[model]
+id = "qwen3-0.6b"
+family = "qwen3"
+params_b = 0.6
+quantization = "fp16"
+engine = "vllm"
+accelerator = "cpu"

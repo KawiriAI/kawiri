@@ -138,3 +138,12 @@ ovmf_file = "OVMF_TDX.fd"
 [assert]
 profile = "production"
 exclude = ["service_no_protect_kernel_tunables_off", "service_no_memory_deny_off"]
+
+[model]
+id = "qwen3-0.6b"
+family = "qwen3"
+params_b = 0.6
+quantization = "Q4_0"
+engine = "llama.cpp"
+accelerator = "gpu"
+ctx_window = 2048

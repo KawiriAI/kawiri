@@ -151,3 +151,11 @@ profile = "production"
 # kawa: PrivateDevices=no for /dev/nvidiactl + /dev/nvidia0 (GPU CC attestation ioctls)
 # vllm: MemoryDenyWriteExecute=no for CUDA JIT, PrivateDevices=no for GPU access
 exclude = ["service_no_protect_kernel_tunables_off", "service_no_memory_deny_off"]
+
+[model]
+id = "qwen3-0.6b"
+family = "qwen3"
+params_b = 0.6
+quantization = "fp16"
+engine = "vllm"
+accelerator = "gpu"

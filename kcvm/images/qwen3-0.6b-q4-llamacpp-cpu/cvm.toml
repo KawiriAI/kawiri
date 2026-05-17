@@ -114,3 +114,16 @@ ovmf_file = "OVMF_TDX.fd"
 [assert]
 profile = "production"
 exclude = ["service_no_protect_kernel_tunables_off"]
+
+# Public model identity — what clients ask for at `?model=`. The
+# image_id captures the implementation (engine × quant × accel × version);
+# the model_id captures only the model itself, so multiple images can
+# serve the same model with different latency/cost/quality trade-offs.
+[model]
+id = "qwen3-0.6b"
+family = "qwen3"
+params_b = 0.6
+quantization = "Q4_0"
+engine = "llama.cpp"
+accelerator = "cpu"
+ctx_window = 8192
